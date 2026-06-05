@@ -18,3 +18,4 @@ INSTALLATION_TESTING.md
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+tmp/**

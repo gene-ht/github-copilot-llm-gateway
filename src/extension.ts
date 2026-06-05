@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { GatewayProvider, RequestStateEvent } from './provider';
+import { openModelSettingsQuickPick } from './modelSettingsPanel';
 import {
   StatusBarState,
   TokenUsage,
@@ -323,59 +324,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   context.subscriptions.push(testCommand);
 
-  // "Configure Server" command — triggered by the "Add Models..." dropdown
-  // via the managementCommand contribution. Prompts for server URL (stored
-  // in workspace/user settings) and API key (stored in SecretStorage,
-  // issue #28). Refreshes the model list when done.
+  // "Manage" command — triggered by the Copilot Language Models panel's
+  // "configure setting" button via the managementCommand contribution.
+  // Shows a QuickPick menu offering Configure Server, Model Settings, etc.
   const manageCommand = vscode.commands.registerCommand(
     'github.copilot.llm-gateway.manage',
     async () => {
-      const config = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
-      const currentUrl = config.get<string>('serverUrl', 'http://localhost:8000');
+      const pick = await vscode.window.showQuickPick(
+        [
+          { label: '$(server) Configure Server', description: 'Set server URL and API key', id: 'server' },
+          { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
+          { label: '$(edit) Edit Custom Headers', description: 'Manage HTTP headers (stored in secret storage)', id: 'headers' },
+          { label: '$(settings-gear) Open Settings', description: 'All LLM Gateway settings', id: 'settings' },
+          { label: '$(refresh) Refresh Models', description: 'Re-fetch model list from server', id: 'refresh' },
+        ],
+        { title: 'LLM Gateway', placeHolder: 'Choose an action' }
+      );
+      if (!pick) { return; }
 
-      const url = await vscode.window.showInputBox({
-        title: 'LLM Gateway — Server URL',
-        prompt: 'Enter the inference server URL (OpenAI-compatible endpoint)',
-        value: currentUrl,
-        placeHolder: 'http://localhost:8000',
-        ignoreFocusOut: true,
-        validateInput: (value) => {
-          try {
-            new URL(value);
-            return undefined;
-          } catch {
-            return 'Please enter a valid URL';
-          }
-        },
-      });
-      if (url === undefined) { return; } // cancelled
-
-      const apiKey = await vscode.window.showInputBox({
-        title: 'LLM Gateway — API Key',
-        prompt: 'Enter the API key — saved to VS Code\'s secret storage. Leave empty to clear.',
-        password: true,
-        placeHolder: 'Optional',
-        ignoreFocusOut: true,
-      });
-      if (apiKey === undefined) { return; } // cancelled
-
-      // Let the user choose Workspace vs. User scope so different VS Code
-      // windows can point at different inference servers (issue #23). Only
-      // applies to `serverUrl` — the API key is always global because
-      // SecretStorage isn't workspace-aware.
-      const target = await pickConfigurationTarget(config);
-      if (target === undefined) { return; } // cancelled
-
-      await config.update('serverUrl', url, target);
-      await provider.setApiKey(apiKey);
-
-      // The config-change listener handles reloadConfig + model refresh
-      // automatically, but we also refresh the status bar here.
-      provider.invalidateModelCache();
-      provider.refreshModels();
-      await refreshStatusBar();
-
-      await offerAdvancedSettings(provider);
+      switch (pick.id) {
+        case 'server':
+          await configureServerFlow(provider, refreshStatusBar);
+          break;
+        case 'modelSettings':
+          await vscode.commands.executeCommand('github.copilot.llm-gateway.modelSettings');
+          break;
+        case 'headers':
+          await vscode.commands.executeCommand('github.copilot.llm-gateway.editCustomHeaders');
+          break;
+        case 'settings':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'github.copilot.llm-gateway');
+          break;
+        case 'refresh':
+          await vscode.commands.executeCommand('github.copilot.llm-gateway.refreshModels');
+          break;
+      }
     }
   );
 
@@ -414,6 +397,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(refreshCommand);
+
+  const modelSettingsCommand = vscode.commands.registerCommand(
+    'github.copilot.llm-gateway.modelSettings',
+    async () => {
+      const snapshot = provider.getStatusSnapshot();
+      await openModelSettingsQuickPick(snapshot.models);
+    }
+  );
+
+  context.subscriptions.push(modelSettingsCommand);
 }
 
 /**
@@ -421,6 +414,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  */
 export function deactivate(): void {
   // no-op
+}
+
+/**
+ * The original "Configure Server" flow extracted from the manage command.
+ * Prompts for server URL + API key, saves, refreshes models.
+ */
+async function configureServerFlow(
+  provider: GatewayProvider,
+  refreshStatusBar: () => Promise<void>
+): Promise<void> {
+  const config = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
+  const currentUrl = config.get<string>('serverUrl', 'http://localhost:8000');
+
+  const url = await vscode.window.showInputBox({
+    title: 'LLM Gateway — Server URL',
+    prompt: 'Enter the inference server URL (OpenAI-compatible endpoint)',
+    value: currentUrl,
+    placeHolder: 'http://localhost:8000',
+    ignoreFocusOut: true,
+    validateInput: (value) => {
+      try {
+        new URL(value);
+        return undefined;
+      } catch {
+        return 'Please enter a valid URL';
+      }
+    },
+  });
+  if (url === undefined) { return; }
+
+  const apiKey = await vscode.window.showInputBox({
+    title: 'LLM Gateway — API Key',
+    prompt: 'Enter the API key — saved to VS Code\'s secret storage. Leave empty to clear.',
+    password: true,
+    placeHolder: 'Optional',
+    ignoreFocusOut: true,
+  });
+  if (apiKey === undefined) { return; }
+
+  const target = await pickConfigurationTarget(config);
+  if (target === undefined) { return; }
+
+  await config.update('serverUrl', url, target);
+  await provider.setApiKey(apiKey);
+
+  provider.invalidateModelCache();
+  provider.refreshModels();
+  await refreshStatusBar();
+
+  await offerAdvancedSettings(provider);
 }
 
 /**

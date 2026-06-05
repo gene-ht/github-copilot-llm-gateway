@@ -52,7 +52,7 @@ export function inferModelFamily(id: string): string {
  * Used as the `detail` shown under the model name in the picker.
  */
 export function describeModel(model: OpenAIModel): string {
-  const context = model.max_model_len ?? model.context_length ?? model.context_window;
+  const context = model.max_input_tokens ?? model.max_model_len ?? model.context_length ?? model.context_window;
   const parts: string[] = [];
   if (context) {
     parts.push(`${formatTokens(context)} ctx`);
@@ -70,18 +70,42 @@ function formatTokens(n: number): string {
 }
 
 /**
- * Deduplicate a list of models by `id`, preserving first-seen order. Servers
- * occasionally return the same id twice (e.g. LoRA adapters sharing a base
- * model id); the picker shouldn't show duplicates.
+ * Deduplicate a list of models by `id`.
+ *
+ * Servers sometimes return the same id multiple times (for example, a single
+ * gateway aggregating several upstream vendors that each advertise the same
+ * model id but with slightly different capability metadata). Naively keeping
+ * the first occurrence loses information: in particular, an upstream that
+ * reports a much smaller `max_input_tokens` than the model truly supports
+ * would silently cap users to the wrong context window.
+ *
+ * Strategy: keep the entry with the largest `max_input_tokens` for each id
+ * (assuming the largest reporter is the most accurate about the model's
+ * real capacity), while preserving the first-seen relative order of ids in
+ * the output so the picker UI stays stable across refreshes.
+ *
+ * Ties (or missing `max_input_tokens` on every entry) fall back to first-seen,
+ * matching the previous behaviour.
  */
 export function dedupeModels(models: readonly OpenAIModel[]): OpenAIModel[] {
-  const seen = new Set<string>();
-  const result: OpenAIModel[] = [];
+  const bestById = new Map<string, OpenAIModel>();
+  const firstSeenOrder: string[] = [];
+
   for (const model of models) {
-    if (!seen.has(model.id)) {
-      seen.add(model.id);
-      result.push(model);
+    const existing = bestById.get(model.id);
+    if (!existing) {
+      bestById.set(model.id, model);
+      firstSeenOrder.push(model.id);
+      continue;
+    }
+    // Prefer the entry advertising the larger context window. Missing values
+    // are treated as 0 so any reported value beats no value.
+    const existingCtx = existing.max_input_tokens ?? 0;
+    const candidateCtx = model.max_input_tokens ?? 0;
+    if (candidateCtx > existingCtx) {
+      bestById.set(model.id, model);
     }
   }
-  return result;
+
+  return firstSeenOrder.map((id) => bestById.get(id)!);
 }

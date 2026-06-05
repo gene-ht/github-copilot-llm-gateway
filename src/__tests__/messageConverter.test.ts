@@ -31,21 +31,17 @@ describe('encodeImageAsDataUrl', () => {
 });
 
 describe('convertMessage', () => {
-  test('converts a plain user text message to an array-content message', () => {
+  test('converts a plain user text message to string content', () => {
     const result = convertMessage(textMsg('user', 'hello'), WITHOUT_IMAGES);
     assert.equal(result.length, 1);
     assert.equal(result[0].role, 'user');
-    const parts = result[0].content as Array<Record<string, unknown>>;
-    assert.equal(parts.length, 1);
-    assert.equal(parts[0].type, 'text');
-    assert.equal(parts[0].text, 'hello');
+    assert.equal(result[0].content, 'hello');
   });
 
-  test('converts an assistant text message to an array-content message', () => {
+  test('converts an assistant text message to string content', () => {
     const result = convertMessage(textMsg('assistant', 'sure'), WITHOUT_IMAGES);
     assert.equal(result[0].role, 'assistant');
-    const parts = result[0].content as Array<Record<string, unknown>>;
-    assert.equal(parts[0].text, 'sure');
+    assert.equal(result[0].content, 'sure');
   });
 
   test('emits array content when images are enabled and included', () => {
@@ -77,9 +73,8 @@ describe('convertMessage', () => {
       ],
     };
     const result = convertMessage(msg, WITHOUT_IMAGES, (m) => logs.push(m));
-    const parts = result[0].content as Array<Record<string, unknown>>;
-    assert.equal(parts.length, 1);
-    assert.equal(parts[0].type, 'text');
+    // With image skipped, pure-text user message becomes string content
+    assert.equal(result[0].content, 'hi');
     assert.ok(logs.some((m) => m.includes('Skipping data part')));
   });
 
@@ -112,13 +107,13 @@ describe('convertMessage', () => {
     assert.equal(fn.arguments, JSON.stringify({ q: 'x' }));
   });
 
-  test('assistant with only tool calls has null content', () => {
+  test('assistant with only tool calls has empty string content', () => {
     const msg: NormalizedMessage = {
       role: 'assistant',
       parts: [{ kind: 'toolCall', callId: 'c1', name: 'f', input: {} }],
     };
     const result = convertMessage(msg, WITHOUT_IMAGES);
-    assert.equal(result[0].content, null);
+    assert.equal(result[0].content, '');
   });
 
   test('tool result part produces a role:tool message', () => {
@@ -173,9 +168,8 @@ describe('convertMessage', () => {
     };
     const result = convertMessage(msg, WITHOUT_IMAGES);
     assert.equal(result.length, 1);
-    const parts = result[0].content as Array<Record<string, unknown>>;
-    assert.equal(parts.length, 1);
-    assert.equal(parts[0].text, 'hi');
+    // Pure-text user message becomes string content
+    assert.equal(result[0].content, 'hi');
   });
 
   test('logs image addition with URL length', () => {
@@ -186,6 +180,20 @@ describe('convertMessage', () => {
     };
     convertMessage(msg, WITH_IMAGES, (m) => logs.push(m));
     assert.ok(logs.some((m) => m.includes('Added image data part')));
+  });
+
+  test('skips image parts on assistant messages', () => {
+    const logs: string[] = [];
+    const msg: NormalizedMessage = {
+      role: 'assistant',
+      parts: [
+        { kind: 'text', value: 'text only' },
+        { kind: 'image', mimeType: 'image/png', data: new Uint8Array([1]) },
+      ],
+    };
+    const result = convertMessage(msg, WITH_IMAGES, (m) => logs.push(m));
+    assert.equal(result[0].content, 'text only');
+    assert.ok(logs.some((m) => m.includes('Skipping image data part on non-user message')));
   });
 });
 

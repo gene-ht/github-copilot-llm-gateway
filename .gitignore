@@ -5,6 +5,7 @@
 # Logs
 logs
 *.log
+tmp/llm-gateway-debug-request.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

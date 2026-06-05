@@ -15,29 +15,44 @@ describe('estimateTextTokens', () => {
     assert.equal(estimateTextTokens(''), 0);
   });
 
-  test('returns ceil(length / 4)', () => {
+  test('returns ceil(byteLength / BYTES_PER_TOKEN) for ASCII', () => {
+    const B = TOKEN_CONSTANTS.BYTES_PER_TOKEN;
+    // ASCII: 1 char = 1 byte
     assert.equal(estimateTextTokens('a'), 1);
-    assert.equal(estimateTextTokens('abcd'), 1);
-    assert.equal(estimateTextTokens('abcde'), 2);
-    assert.equal(estimateTextTokens('a'.repeat(400)), 100);
+    assert.equal(estimateTextTokens('a'.repeat(B)), 1);
+    assert.equal(estimateTextTokens('a'.repeat(B + 1)), 2);
+    assert.equal(estimateTextTokens('a'.repeat(B * 100)), 100);
+  });
+
+  test('CJK characters count by UTF-8 byte length (3 bytes per char)', () => {
+    // "中" = 3 bytes in UTF-8 → ceil(3/2) = 2 tokens
+    assert.equal(estimateTextTokens('中'), 2);
+    // "中文" = 6 bytes → 3 tokens
+    assert.equal(estimateTextTokens('中文'), 3);
   });
 });
 
 describe('estimateMessageTokens', () => {
   test('handles string content', () => {
-    assert.equal(estimateMessageTokens({ content: 'hello world' }), Math.ceil('hello world'.length / 4));
+    const B = TOKEN_CONSTANTS.BYTES_PER_TOKEN;
+    assert.equal(
+      estimateMessageTokens({ content: 'hello world' }),
+      Math.ceil(Buffer.byteLength('hello world', 'utf8') / B)
+    );
   });
 
   test('handles array content', () => {
+    const B = TOKEN_CONSTANTS.BYTES_PER_TOKEN;
     const msg = { content: [{ type: 'text', text: 'hi' }] };
     const serialized = JSON.stringify(msg.content);
-    assert.equal(estimateMessageTokens(msg), Math.ceil(serialized.length / 4));
+    assert.equal(estimateMessageTokens(msg), Math.ceil(Buffer.byteLength(serialized, 'utf8') / B));
   });
 
   test('adds tool_calls contribution', () => {
+    const B = TOKEN_CONSTANTS.BYTES_PER_TOKEN;
     const msg = { content: 'x', tool_calls: [{ id: '1', name: 'foo' }] };
-    const expected = Math.ceil(('x' + JSON.stringify(msg.tool_calls)).length / 4);
-    assert.equal(estimateMessageTokens(msg), expected);
+    const combined = 'x' + JSON.stringify(msg.tool_calls);
+    assert.equal(estimateMessageTokens(msg), Math.ceil(Buffer.byteLength(combined, 'utf8') / B));
   });
 
   test('handles empty message', () => {
@@ -95,14 +110,13 @@ describe('truncateMessagesToFit', () => {
 
   test('prefers recent messages over middle ones when truncating', () => {
     const messages = [
-      { content: 'first' },
-      { content: 'middle-older' },
-      { content: 'middle-newer' },
-      { content: 'last' },
+      { content: 'first' },         // 5 bytes → 3 tokens
+      { content: 'middle-older' },  // 12 bytes → 6 tokens
+      { content: 'middle-newer' },  // 12 bytes → 6 tokens
+      { content: 'last' },          // 4 bytes → 2 tokens
     ];
-    // estimateMessageTokens('first')=2, 'middle-older'=3, 'middle-newer'=3, 'last'=1
-    // Budget 4 tokens: first(2) + last(1) = 3 ≤ 4; +middle-newer would be 6 > 4. Keep first+last.
-    const result = truncateMessagesToFit(messages, 4);
+    // Budget 5 tokens: first(3) + last(2) = 5 ≤ 5; +middle-newer would be 11 > 5. Keep first+last.
+    const result = truncateMessagesToFit(messages, 5);
     assert.deepEqual(
       result.map((m) => m.content),
       ['first', 'last']

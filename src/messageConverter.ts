@@ -78,7 +78,9 @@ export function convertMessage(
   for (const part of message.parts) {
     switch (part.kind) {
       case 'text':
-        userContent.push({ type: 'text', text: part.value });
+        if (message.role === 'user') {
+          userContent.push({ type: 'text', text: part.value });
+        }
         textContent += part.value;
         break;
 
@@ -104,6 +106,10 @@ export function convertMessage(
         break;
 
       case 'image':
+        if (message.role !== 'user') {
+          log(`  Skipping image data part on non-user message: role=${message.role}`);
+          break;
+        }
         if (!options.enableImageInput) {
           log(
             `  Skipping data part: mimeType=${part.mimeType}, size=${part.data.length} bytes. (Please enable github.copilot.llm-gateway.enableImageInput in settings)`
@@ -132,11 +138,23 @@ export function convertMessage(
 
   const result: OpenAIMessage[] = [];
   if (toolCalls.length > 0) {
-    result.push({ role: 'assistant', content: textContent || null, tool_calls: toolCalls });
+    // Some OpenAI-compatible Anthropic gateways drop assistant tool-call turns
+    // whose content is JSON null, which makes the following role:tool message
+    // look like an orphan tool_result. Use an empty string instead.
+    result.push({ role: 'assistant', content: textContent || '', tool_calls: toolCalls });
   } else if (toolResults.length > 0) {
     result.push(...toolResults);
-  } else if (userContent.length > 0) {
-    result.push({ role: message.role, content: userContent });
+  } else if (message.role === 'user' && userContent.length > 0) {
+    // Use string content for pure-text user messages (no images).
+    // Some Anthropic-compatible gateways treat array-content user messages
+    // differently (e.g. extracting as system prompt), which can shift message
+    // boundaries and break tool_use/tool_result pairing.
+    const hasNonText = userContent.some((p) => p.type !== 'text');
+    if (hasNonText) {
+      result.push({ role: message.role, content: userContent });
+    } else {
+      result.push({ role: message.role, content: textContent });
+    }
   } else if (textContent) {
     result.push({ role: message.role, content: textContent });
   }
@@ -155,6 +173,53 @@ export function convertMessages(
   const result: OpenAIMessage[] = [];
   for (const msg of messages) {
     result.push(...convertMessage(msg, options, log));
+  }
+  return result;
+}
+
+/**
+ * Regex that matches `<conversation-summary>...</conversation-summary>` blocks
+ * (including multiline content). Used by {@link stripConversationSummary}.
+ */
+const CONVERSATION_SUMMARY_RE = /<conversation-summary>[\s\S]*?<\/conversation-summary>/g;
+
+/**
+ * Strip `<conversation-summary>` XML blocks from OpenAI message content.
+ *
+ * Copilot Chat's agent mode injects cross-session summaries into the messages
+ * passed to the provider. These can leak context between unrelated sessions.
+ * This post-processing step removes those blocks so each session starts clean.
+ *
+ * Only affects `role: user` messages with string content. Messages that become
+ * empty after stripping are dropped entirely.
+ */
+export function stripConversationSummary(
+  messages: readonly OpenAIMessage[],
+  log: ConverterLogger = NOOP_LOGGER
+): OpenAIMessage[] {
+  let strippedCount = 0;
+  const result: OpenAIMessage[] = [];
+
+  for (const msg of messages) {
+    const role = (msg as Record<string, unknown>).role;
+    const content = (msg as Record<string, unknown>).content;
+
+    if (role === 'user' && typeof content === 'string' && CONVERSATION_SUMMARY_RE.test(content)) {
+      const cleaned = content.replace(CONVERSATION_SUMMARY_RE, '').trim();
+      strippedCount++;
+      if (cleaned.length > 0) {
+        result.push({ ...msg, content: cleaned });
+      }
+      // Reset regex lastIndex since we used the global flag
+      CONVERSATION_SUMMARY_RE.lastIndex = 0;
+      continue;
+    }
+
+    result.push(msg);
+  }
+
+  if (strippedCount > 0) {
+    log(`Stripped <conversation-summary> from ${strippedCount} message(s)`);
   }
   return result;
 }

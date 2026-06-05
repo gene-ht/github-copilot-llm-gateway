@@ -87,7 +87,24 @@ describe('buildModelInfo id-derived fields', () => {
 });
 
 describe('buildModelInfo context resolution', () => {
-  test('prefers max_model_len over the other context fields', () => {
+  test('prefers max_input_tokens over the other context fields', () => {
+    const { totalContext, info, hasServerReportedContext } = buildModelInfo({
+      model: baseModel({
+        max_input_tokens: 936000,
+        max_model_len: 131072,
+        context_length: 8192,
+        context_window: 4096,
+      }),
+      defaultMaxTokens: 9999,
+      defaultMaxOutputTokens: 2048,
+      capabilities: {},
+    });
+    assert.equal(totalContext, 936000);
+    assert.equal(info.maxInputTokens, 936000 - 2048 - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER);
+    assert.equal(hasServerReportedContext, true);
+  });
+
+  test('prefers max_model_len over context_length and context_window', () => {
     const { totalContext, info, hasServerReportedContext } = buildModelInfo({
       model: baseModel({
         max_model_len: 131072,
@@ -99,7 +116,7 @@ describe('buildModelInfo context resolution', () => {
       capabilities: {},
     });
     assert.equal(totalContext, 131072);
-    assert.equal(info.maxInputTokens, 131072);
+    assert.equal(info.maxInputTokens, 131072 - 2048 - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER);
     assert.equal(hasServerReportedContext, true);
   });
 

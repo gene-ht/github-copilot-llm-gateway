@@ -48,6 +48,7 @@ export const TOOLTIP_COMMANDS = {
   TestConnection: 'github.copilot.llm-gateway.testConnection',
   EditHeaders: 'github.copilot.llm-gateway.editCustomHeaders',
   OpenSettings: 'workbench.action.openSettings',
+  ModelSettings: 'github.copilot.llm-gateway.modelSettings',
 } as const;
 
 const SETTINGS_QUERY = 'github.copilot.llm-gateway';
@@ -364,6 +365,8 @@ function renderFooter(): string {
     '\n\n',
     `[$(settings-gear) Open settings](command:${c.OpenSettings}?${settingsArg}) · `,
     `[$(output) Show output log](command:${c.Output})`,
+    '\n\n',
+    `[$(list-unordered) Model Settings](command:${c.ModelSettings})`,
   ].join('');
 }
 

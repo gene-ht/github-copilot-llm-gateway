@@ -36,8 +36,8 @@ export interface BuildModelInfoInput {
 
 /**
  * Picker-facing fields plus the resolved total context size. Total context is
- * returned separately because the chat-response path uses it to budget output
- * tokens — relying on `maxInputTokens` alone would double-count.
+ * returned separately because VS Code's `maxInputTokens` means usable prompt
+ * budget, not the model's full context window.
  */
 export interface BuildModelInfoResult {
   readonly info: {
@@ -62,9 +62,9 @@ export interface BuildModelInfoResult {
  * Translate a raw `/v1/models` entry into the picker-facing model info plus
  * the resolved total context.
  *
- * `maxInputTokens` is intentionally set to the full server-reported context so
- * the picker shows the true window size. Output-token budgeting uses
- * `totalContext` separately so the math doesn't double-count.
+ * `maxInputTokens` is the usable prompt budget after reserving the advertised
+ * output budget and a small safety buffer. The full context window is returned
+ * separately as `totalContext` for request-time budgeting and status display.
  */
 export function buildModelInfo({
   model,
@@ -72,7 +72,7 @@ export function buildModelInfo({
   defaultMaxOutputTokens,
   capabilities,
 }: BuildModelInfoInput): BuildModelInfoResult {
-  const serverContext = model.max_model_len ?? model.context_length ?? model.context_window;
+  const serverContext = model.max_input_tokens ?? model.max_model_len ?? model.context_length ?? model.context_window;
   const totalContext = serverContext ?? defaultMaxTokens;
   const maxOutputTokens = Math.min(
     defaultMaxOutputTokens,
@@ -80,6 +80,10 @@ export function buildModelInfo({
       TOKEN_CONSTANTS.MIN_OUTPUT_TOKENS,
       totalContext - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER
     )
+  );
+  const maxInputTokens = Math.max(
+    TOKEN_CONSTANTS.MIN_OUTPUT_TOKENS,
+    totalContext - maxOutputTokens - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER
   );
 
   const description = describeModel(model);
@@ -91,7 +95,7 @@ export function buildModelInfo({
     name: friendlyName,
     family: inferModelFamily(model.id),
     version: friendlyName,
-    maxInputTokens: totalContext,
+    maxInputTokens,
     maxOutputTokens,
     capabilities,
     detail: PROVIDER_DETAIL_LABEL,

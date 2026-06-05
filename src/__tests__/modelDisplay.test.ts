@@ -36,6 +36,14 @@ describe('inferModelFamily', () => {
 });
 
 describe('describeModel', () => {
+  test('uses max_input_tokens when present', () => {
+    const detail = describeModel({
+      id: 'x', object: 'model', created: 0, owned_by: 'copilotcli', max_input_tokens: 936000,
+    });
+    assert.ok(detail.includes('936K ctx'));
+    assert.ok(detail.includes('copilotcli'));
+  });
+
   test('uses max_model_len when present', () => {
     const detail = describeModel({
       id: 'x', object: 'model', created: 0, owned_by: 'vllm', max_model_len: 32768,
@@ -59,15 +67,17 @@ describe('describeModel', () => {
 });
 
 describe('dedupeModels', () => {
-  test('removes duplicate ids, preserving first-seen order', () => {
+  test('uses the largest max_input_tokens for duplicate ids while preserving first-seen id order', () => {
     const models = [
-      { id: 'a', object: 'model', created: 0, owned_by: 'x' },
-      { id: 'b', object: 'model', created: 0, owned_by: 'x' },
-      { id: 'a', object: 'model', created: 0, owned_by: 'y' },
+      { id: 'a', object: 'model', created: 0, owned_by: 'small', max_input_tokens: 1000 },
+      { id: 'b', object: 'model', created: 0, owned_by: 'x', max_input_tokens: 2000 },
+      { id: 'a', object: 'model', created: 0, owned_by: 'large', max_input_tokens: 9000 },
     ];
     const result = dedupeModels(models);
     assert.equal(result.length, 2);
     assert.deepEqual(result.map((m) => m.id), ['a', 'b']);
+    assert.equal(result[0].owned_by, 'large');
+    assert.equal(result[0].max_input_tokens, 9000);
   });
 
   test('returns the same list when all ids are unique', () => {

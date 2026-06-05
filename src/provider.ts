@@ -6,6 +6,7 @@ import {
   NormalizedMessage,
   NormalizedPart,
   NormalizedRole,
+  stripConversationSummary,
 } from './messageConverter';
 import {
   TOKEN_CONSTANTS,
@@ -13,6 +14,8 @@ import {
   calculateMaxInputTokens,
   calculateSafeMaxOutputTokens,
   estimateTextTokens,
+  mergeConsecutiveSameRoleMessages,
+  repairToolCallPairing,
   truncateMessagesToFit,
 } from './tokenBudget';
 import { tryRepairJson } from './jsonRepair';
@@ -178,10 +181,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    */
   private frameworkOverride: FrameworkConfigOverride = {};
   /**
-   * Real server-reported context per model id (`max_model_len` / etc.).
-   * Needed because the picker-facing `maxInputTokens` is the full context
-   * on purpose — the chat-response code path needs the separate true value
-   * so it doesn't double-count when budgeting output tokens.
+   * Real server-reported context per model id (`max_input_tokens` / etc.).
+   * Needed because the picker-facing `maxInputTokens` is only the usable input
+   * budget after reserving output tokens, not the full context window.
    */
   private readonly contextByModelId: Map<string, number> = new Map();
   /**
@@ -571,18 +573,34 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
-    this.outputChannel.appendLine(
-      `Tool mode: ${describeToolMode(options.toolMode)}, Tools: ${options.tools?.length ?? 0}`
-    );
-    this.outputChannel.appendLine(`Message count: ${messages.length}`);
+    if (this.config.verboseLogging) {
+      this.outputChannel.appendLine(`Sending chat request to model: ${model.id}`);
+      this.outputChannel.appendLine(
+        `Tool mode: ${describeToolMode(options.toolMode)}, Tools: ${options.tools?.length ?? 0}`
+      );
+      this.outputChannel.appendLine(`Message count: ${messages.length}`);
+    }
 
     const modelName = friendlyModelName(model.id);
     this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
 
-    const openAIMessages = this.convertAllMessages(messages);
-    this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
-    this.logMessageStructure(openAIMessages);
+    let openAIMessages = this.convertAllMessages(messages);
+
+    // Always-on detection: scan for Copilot Chat's cross-session injection
+    // markers. Logs a one-line summary when triggered so users can correlate
+    // "陌生 TODO 出现"等现象 with the actual injected content. Independent of
+    // verboseLogging so it captures real-world incidents without setup.
+    this.detectCrossSessionInjection(openAIMessages, messages.length);
+
+    if (this.config.stripConversationSummary) {
+      openAIMessages = stripConversationSummary(openAIMessages, (msg) =>
+        this.outputChannel.appendLine(msg)
+      );
+    }
+    if (this.config.verboseLogging) {
+      this.outputChannel.appendLine(`Converted to ${openAIMessages.length} OpenAI messages`);
+      this.logMessageStructure(openAIMessages);
+    }
 
     const modelMaxContext = this.resolveModelMaxContext(model);
     const configuredMaxOutput =
@@ -595,16 +613,50 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       toolsSerializedLength,
     });
 
-    const truncatedMessages = truncateMessagesToFit(openAIMessages, maxInputTokens, (msg) =>
-      this.outputChannel.appendLine(msg)
-    );
-    if (truncatedMessages.length < openAIMessages.length) {
+    const verboseLog = this.config.verboseLogging
+      ? (msg: string) => this.outputChannel.appendLine(msg)
+      : () => { /* no-op */ };
+    const fittedMessages = truncateMessagesToFit(openAIMessages, maxInputTokens, verboseLog);
+    if (fittedMessages.length < openAIMessages.length) {
       this.outputChannel.appendLine(
-        `WARNING: Truncated conversation from ${openAIMessages.length} to ${truncatedMessages.length} messages to fit context limit`
+        `WARNING: Truncated conversation from ${openAIMessages.length} to ${fittedMessages.length} messages to fit context limit`
+      );
+    }
+    // Truncation slices messages by token budget alone and can leave orphan
+    // `role: tool` blocks (or dangling assistant tool_calls) if the matching
+    // counterpart fell off the start of the window. Anthropic-backed gateways
+    // (e.g. Vertex AI Claude) reject such payloads with a 400
+    // "unexpected tool_use_id found in tool_result blocks" error. Strip those
+    // before sending so the same conversation that survives an OpenAI backend
+    // also survives an Anthropic one.
+    // Log first few messages' structure for debugging tool pairing issues
+    if (this.config.verboseLogging) {
+      const preRepairSummary = fittedMessages.slice(0, 8).map((m, i) => {
+        const r = (m as Record<string, unknown>).role;
+        const tcId = (m as Record<string, unknown>).tool_call_id;
+        const hasTc = Array.isArray((m as Record<string, unknown>).tool_calls);
+        return `[${i}] role=${r}${tcId ? ` tool_call_id=${tcId}` : ''}${hasTc ? ' has_tool_calls' : ''}`;
+      });
+      this.outputChannel.appendLine(`Pre-repair first 8: ${preRepairSummary.join(', ')}`);
+    }
+
+    const truncatedMessages = repairToolCallPairing(fittedMessages, verboseLog);
+    if (truncatedMessages.length !== fittedMessages.length) {
+      this.outputChannel.appendLine(
+        `Tool pairing: ${fittedMessages.length} → ${truncatedMessages.length} messages after repair`
+      );
+    } else if (this.config.verboseLogging) {
+      this.outputChannel.appendLine(
+        `Tool pairing: all ${fittedMessages.length} messages passed (no orphans detected)`
       );
     }
 
-    const inputText = buildInputText(truncatedMessages);
+    // Merge consecutive same-role user messages so the Anthropic gateway's
+    // OpenAI→Anthropic converter doesn't shift message boundaries and
+    // misalign tool_use/tool_result pairing.
+    const finalMessages = mergeConsecutiveSameRoleMessages(truncatedMessages, verboseLog);
+
+    const inputText = buildInputText(finalMessages);
     const toolsOverhead = Math.ceil(toolsSerializedLength / TOKEN_CONSTANTS.CHARS_PER_TOKEN);
     const estimatedInputTokens = await this.provideTokenCount(model, inputText, token);
     const safeMaxOutputTokens = calculateSafeMaxOutputTokens({
@@ -614,32 +666,107 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       configuredMaxOutput,
     });
 
-    this.outputChannel.appendLine(
-      `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
-    );
+    if (this.config.verboseLogging) {
+      this.outputChannel.appendLine(
+        `Token estimate: input=${estimatedInputTokens}, tools=${toolsOverhead}, model_context=${modelMaxContext}, chosen_max_tokens=${safeMaxOutputTokens}`
+      );
+    }
 
     const { tools, schemas: toolSchemas } = this.buildToolsConfig(options);
     const hasTools = tools !== undefined && tools.length > 0;
     const temperature = hasTools ? this.config.agentTemperature : DEFAULT_TEMPERATURE;
 
+    // Always-on log: dump the effective per-model settings + final max_tokens
+    // so users can verify their `perModelSettings.<modelId>.max_tokens` override
+    // is actually being applied at request time. Independent of verboseLogging
+    // because this is critical for "my setting didn't take effect" debugging.
+    // VS Code returns configuration values as Proxy/getter-backed objects, not
+    // plain objects. Spreading them via `{...src}` enumerates own keys and
+    // invokes each getter; if any getter throws (e.g. a key like
+    // `reasoning_effort` whose backing config is undefined), the spread
+    // crashes the entire request. Use a safe shallow-clone that:
+    //   1) accepts any object-like input,
+    //   2) iterates own enumerable keys,
+    //   3) skips keys whose getters throw,
+    //   4) drops `undefined` values to avoid `JSON.stringify` clutter.
+    const safeShallowClone = (src: unknown, label: string): Record<string, unknown> => {
+      const out: Record<string, unknown> = {};
+      if (!src || typeof src !== 'object') { return out; }
+      let keys: string[];
+      try {
+        keys = Object.keys(src as Record<string, unknown>);
+      } catch (err) {
+        this.outputChannel.appendLine(
+          `[Settings] WARNING: Object.keys(${label}) threw: ${err instanceof Error ? err.message : String(err)}`
+        );
+        return out;
+      }
+      for (const key of keys) {
+        try {
+          const value = (src as Record<string, unknown>)[key];
+          if (value !== undefined) {
+            out[key] = value;
+          }
+        } catch (err) {
+          this.outputChannel.appendLine(
+            `[Settings] WARNING: skipped ${label}.${key} — getter threw: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+      return out;
+    };
+
+    const perModelOverride = safeShallowClone(
+      this.config.perModelSettings[model.id],
+      `perModelSettings[${model.id}]`
+    );
+    const callerOverride = safeShallowClone(options.modelOptions, 'options.modelOptions');
+    const extraModelOptions = safeShallowClone(this.config.extraModelOptions, 'extraModelOptions');
+    this.outputChannel.appendLine(
+      `[Settings] model=${model.id} ` +
+      `safeMaxOutputTokens=${safeMaxOutputTokens} ` +
+      `perModel.keys=[${Object.keys(perModelOverride).join(',') || '(none)'}] ` +
+      `caller.keys=[${Object.keys(callerOverride).join(',') || '(none)'}]`
+    );
+    if (Object.keys(perModelOverride).length > 0) {
+      this.outputChannel.appendLine(
+        `[Settings] perModelSettings[${model.id}] = ${JSON.stringify(perModelOverride)}`
+      );
+    }
+
     const requestOptions = buildChatRequest({
       model: model.id,
-      messages: truncatedMessages,
+      messages: finalMessages,
       maxTokens: safeMaxOutputTokens,
       temperature,
       tools,
       toolChoice: hasTools ? this.mapToolChoice(options.toolMode) : undefined,
       parallelToolCalls: hasTools ? this.config.parallelToolCalling : undefined,
-      extraOptions: { ...this.config.extraModelOptions, ...options.modelOptions },
+      extraOptions: {
+        ...extraModelOptions,
+        ...perModelOverride,
+        ...callerOverride,
+      },
     });
 
-    if (hasTools) {
+    // Confirm the final values that will be sent on the wire.
+    this.outputChannel.appendLine(
+      `[Settings] final request: max_tokens=${requestOptions.max_tokens} ` +
+      `temperature=${requestOptions.temperature}` +
+      ((requestOptions as Record<string, unknown>).reasoning_effort !== undefined
+        ? ` reasoning_effort=${(requestOptions as Record<string, unknown>).reasoning_effort}`
+        : '')
+    );
+
+    if (hasTools && this.config.verboseLogging) {
       this.outputChannel.appendLine(
         `Sending ${tools.length} tools to model (parallel: ${this.config.parallelToolCalling})`
       );
     }
 
-    this.logRequest(requestOptions);
+    if (this.config.verboseLogging) {
+      this.logRequest(requestOptions);
+    }
 
     let capturedUsage: TokenUsage | undefined;
     try {
@@ -654,9 +781,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         resolveToolCallArgs: (toolCall) => this.resolveToolCallArgs(toolCall, toolSchemas),
       });
 
-      this.outputChannel.appendLine(
-        `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
-      );
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
+        );
+      }
 
       if (isEmptyStreamResult(stats)) {
         const toolCount = tools?.length ?? 0;
@@ -798,10 +927,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Resolve the real server-reported context size for a model. The
-   * picker-facing `maxInputTokens` equals `totalContext`, so naive
-   * `maxInputTokens + maxOutputTokens` would overshoot by `maxOutputTokens`
-   * and cause context-length errors at the server.
+   * Resolve the real server-reported context size for a model. Prefer the
+   * per-id context map captured from `/v1/models`; if VS Code routes a cached
+   * model before a fresh fetch, reconstruct an approximate total from the
+   * picker-facing input/output budgets.
    */
   private resolveModelMaxContext(model: vscode.LanguageModelChatInformation): number {
     const cached = this.contextByModelId.get(model.id);
@@ -809,11 +938,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       return cached;
     }
     // Fallback path: the model list hasn't been fetched yet in this session
-    // (e.g. VS Code routed a cached chat directly to the provider). Use the
-    // picker-facing input window, which equals totalContext after the
-    // provideLanguageModelChatInformation change.
+    // (e.g. VS Code routed a cached chat directly to the provider). Rebuild
+    // the approximate total context from the picker-facing input/output budget.
     if (model.maxInputTokens && model.maxInputTokens > 0) {
-      return model.maxInputTokens;
+      return model.maxInputTokens + (model.maxOutputTokens || 0) + TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER;
     }
     return TOKEN_CONSTANTS.DEFAULT_CONTEXT_TOKENS;
   }
@@ -822,7 +950,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
 
   private convertAllMessages(messages: readonly vscode.LanguageModelChatMessage[]): OpenAIMessage[] {
     const result: OpenAIMessage[] = [];
-    const log = (msg: string): void => this.outputChannel.appendLine(msg);
+    // Per-part `Found tool call/result:` lines are firehose-level detail —
+    // gate them behind verboseLogging so the Output channel stays readable
+    // unless the user explicitly opts in.
+    const log: (msg: string) => void = this.config.verboseLogging
+      ? (msg) => this.outputChannel.appendLine(msg)
+      : () => { /* no-op */ };
     for (const msg of messages) {
       const normalized: NormalizedMessage = {
         role: this.mapRole(msg.role),
@@ -879,7 +1012,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const anyPart = part as Record<string, unknown>;
 
     if ('callId' in anyPart && 'content' in anyPart && !('name' in anyPart)) {
-      this.outputChannel.appendLine(`  Found tool result (duck-typed): callId=${anyPart.callId}`);
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(`  Found tool result (duck-typed): callId=${anyPart.callId}`);
+      }
       return {
         kind: 'toolResult',
         callId: String(anyPart.callId),
@@ -888,9 +1023,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       };
     }
     if ('callId' in anyPart && 'name' in anyPart && 'input' in anyPart) {
-      this.outputChannel.appendLine(
-        `  Found tool call (duck-typed): callId=${anyPart.callId}, name=${anyPart.name}`
-      );
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `  Found tool call (duck-typed): callId=${anyPart.callId}, name=${anyPart.name}`
+        );
+      }
       return {
         kind: 'toolCall',
         callId: String(anyPart.callId),
@@ -925,16 +1062,19 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       return { tools: undefined, schemas };
     }
 
+    const verbose = this.config.verboseLogging;
     const tools: OpenAIToolDefinition[] = options.tools.map((tool) => {
-      this.outputChannel.appendLine(`Tool: ${tool.name}`);
-      this.outputChannel.appendLine(
-        `  Description: ${formatToolDescription(tool.description)}`
-      );
+      if (verbose) {
+        this.outputChannel.appendLine(`Tool: ${tool.name}`);
+        this.outputChannel.appendLine(
+          `  Description: ${formatToolDescription(tool.description)}`
+        );
+      }
 
       const schema = tool.inputSchema as Record<string, unknown> | undefined;
       schemas.set(tool.name, schema);
 
-      if (schema?.required && Array.isArray(schema.required)) {
+      if (verbose && schema?.required && Array.isArray(schema.required)) {
         this.outputChannel.appendLine(
           `  Required properties: ${(schema.required as string[]).join(', ')}`
         );
@@ -962,23 +1102,28 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     toolCall: { id: string; name: string; arguments: string },
     toolSchemas: Map<string, Record<string, unknown> | undefined>
   ): Record<string, unknown> {
-    this.outputChannel.appendLine(`\n=== TOOL CALL RECEIVED ===`);
-    this.outputChannel.appendLine(`  ID: ${toolCall.id}`);
-    this.outputChannel.appendLine(`  Name: ${toolCall.name}`);
-    this.outputChannel.appendLine(
-      `  Raw arguments: ${toolCall.arguments.substring(0, MAX_TOOL_ARGS_LOG_LENGTH)}${
-        toolCall.arguments.length > MAX_TOOL_ARGS_LOG_LENGTH ? '...' : ''
-      }`
-    );
+    const verbose = this.config.verboseLogging;
+    if (verbose) {
+      this.outputChannel.appendLine(`\n=== TOOL CALL RECEIVED ===`);
+      this.outputChannel.appendLine(`  ID: ${toolCall.id}`);
+      this.outputChannel.appendLine(`  Name: ${toolCall.name}`);
+      this.outputChannel.appendLine(
+        `  Raw arguments: ${toolCall.arguments.substring(0, MAX_TOOL_ARGS_LOG_LENGTH)}${
+          toolCall.arguments.length > MAX_TOOL_ARGS_LOG_LENGTH ? '...' : ''
+        }`
+      );
+    }
 
-    const log = (msg: string): void => this.outputChannel.appendLine(msg);
+    const log = verbose
+      ? (msg: string): void => this.outputChannel.appendLine(msg)
+      : () => { /* no-op */ };
     let args = tryRepairJson(toolCall.arguments, log) as Record<string, unknown> | null;
 
     if (args === null) {
-      this.outputChannel.appendLine(`  ERROR: Failed to parse tool call arguments`);
+      this.outputChannel.appendLine(`  ERROR: Failed to parse tool call arguments for ${toolCall.name}`);
       this.outputChannel.appendLine(`  Full arguments: ${toolCall.arguments}`);
       args = {};
-    } else {
+    } else if (verbose) {
       const argKeys = Object.keys(args);
       this.outputChannel.appendLine(
         `  Parsed argument keys: ${argKeys.length > 0 ? argKeys.join(', ') : '(none)'}`
@@ -990,7 +1135,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       args = fillMissingRequiredProperties(args, toolSchema, log);
     }
 
-    this.outputChannel.appendLine(`=== END TOOL CALL ===\n`);
+    if (verbose) {
+      this.outputChannel.appendLine(`=== END TOOL CALL ===\n`);
+    }
     return args;
   }
 
@@ -1011,9 +1158,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         // The shape mirrors OpenAI's `usage` object. Surfacing it here makes
         // the chat view's context-window widget render real numbers instead
         // of `0%` for gateway models (issue #24).
-        this.outputChannel.appendLine(
-          `Usage: prompt=${usage.prompt_tokens}, completion=${usage.completion_tokens}, total=${usage.total_tokens}`
-        );
+        if (this.config.verboseLogging) {
+          this.outputChannel.appendLine(
+            `Usage: prompt=${usage.prompt_tokens}, completion=${usage.completion_tokens}, total=${usage.total_tokens}`
+          );
+        }
         onUsage?.({
           prompt: usage.prompt_tokens,
           completion: usage.completion_tokens,
@@ -1026,6 +1175,79 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   // ---------- logging helpers ----------
+
+  /**
+   * Always-on detector for Copilot Chat's cross-session injection.
+   *
+   * Scans converted OpenAI messages for known markers (`<conversation-summary>`,
+   * `<system-reminder>`, top-level TODO blocks, etc.). When a marker is found,
+   * logs a one-line summary so users can correlate "unexpected TODO appeared"
+   * incidents with the actual injected content.
+   *
+   * Runs regardless of `verboseLogging` because cross-session leak detection
+   * needs to capture incidents in normal use, not just during debug sessions.
+   */
+  private detectCrossSessionInjection(
+    openAIMessages: readonly OpenAIMessage[],
+    vsCodeMessageCount: number
+  ): void {
+    const markers: Array<{ name: string; regex: RegExp; count: number; firstHit?: { msgIndex: number; snippet: string } }> = [
+      { name: '<conversation-summary>', regex: /<conversation-summary>/g, count: 0 },
+      { name: '<system-reminder>', regex: /<system-reminder>/g, count: 0 },
+      { name: '<previous-conversation>', regex: /<previous-conversation>/g, count: 0 },
+      { name: 'conversation_summary', regex: /conversation_summary/g, count: 0 },
+    ];
+
+    for (let i = 0; i < openAIMessages.length; i++) {
+      const msg = openAIMessages[i];
+      const content = (msg as Record<string, unknown>).content;
+      const text =
+        typeof content === 'string'
+          ? content
+          : Array.isArray(content)
+            ? content
+                .map((p) =>
+                  typeof p === 'object' && p !== null && typeof (p as Record<string, unknown>).text === 'string'
+                    ? (p as Record<string, unknown>).text
+                    : ''
+                )
+                .join('\n')
+            : '';
+      if (typeof text !== 'string' || text.length === 0) { continue; }
+
+      for (const m of markers) {
+        const matches = text.match(m.regex);
+        if (matches && matches.length > 0) {
+          m.count += matches.length;
+          if (!m.firstHit) {
+            // Capture a 200-char window around the first occurrence to help diagnose
+            const idx = text.search(m.regex);
+            const start = Math.max(0, idx - 50);
+            const end = Math.min(text.length, idx + 150);
+            m.firstHit = {
+              msgIndex: i,
+              snippet: text.slice(start, end).replace(/\n/g, ' '),
+            };
+          }
+        }
+      }
+    }
+
+    const triggered = markers.filter((m) => m.count > 0);
+    if (triggered.length === 0) { return; }
+
+    this.outputChannel.appendLine(
+      `[Cross-session detector] Detected injection markers in request (${vsCodeMessageCount} messages):`
+    );
+    for (const m of triggered) {
+      this.outputChannel.appendLine(
+        `  ${m.name}: ${m.count} occurrence(s), first at message[${m.firstHit?.msgIndex}]`
+      );
+      if (m.firstHit) {
+        this.outputChannel.appendLine(`    snippet: ...${m.firstHit.snippet}...`);
+      }
+    }
+  }
 
   private logMessageStructure(openAIMessages: readonly OpenAIMessage[]): void {
     for (let i = 0; i < openAIMessages.length; i++) {
@@ -1208,6 +1430,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       verboseLogging: config.get<boolean>('verboseLogging', false),
       customHeaders: { ...this.secretCache.customHeaders },
       extraModelOptions: config.get<Record<string, unknown>>('extraModelOptions', {}) ?? {},
+      perModelSettings: config.get<Record<string, Record<string, unknown>>>('perModelSettings', {}) ?? {},
+      stripConversationSummary: config.get<boolean>('stripConversationSummary', false),
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)

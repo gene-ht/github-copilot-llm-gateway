@@ -120,6 +120,17 @@ const ERROR_PREFIX = 'Inference server reported an error mid-stream: ';
  * streaming chat-completion request. Returned by `createStreamTimers` so the
  * main streaming function doesn't have to track them inline.
  */
+/**
+ * Why the AbortController fired. `null` means it hasn't fired yet. Captured by
+ * the closures inside `createStreamTimers` so `streamChatCompletion` can turn
+ * the otherwise-opaque "This operation was aborted" error into a descriptive
+ * message identifying which timer / cancellation source tripped.
+ */
+type AbortReason =
+  | { kind: 'cancellation' }
+  | { kind: 'header-timeout'; timeoutMs: number }
+  | { kind: 'inactivity-timeout'; timeoutMs: number; phase: 'pre-headers' | 'streaming' };
+
 interface StreamTimers {
   readonly controller: AbortController;
   readonly resetInactivity: () => void;
@@ -127,6 +138,22 @@ interface StreamTimers {
   readonly onHeadersReceived: () => void;
   /** Clears every outstanding timer + cancellation subscription. */
   readonly dispose: () => void;
+  /** What caused `controller.abort()` to fire (null = not aborted). */
+  readonly getAbortReason: () => AbortReason | null;
+}
+
+/** Human-readable explanation of an AbortReason, used in error messages and logs. */
+function describeAbortReason(reason: AbortReason): string {
+  switch (reason.kind) {
+    case 'cancellation':
+      return 'cancelled by VS Code (Copilot Chat stopped or switched the request)';
+    case 'header-timeout':
+      return `no HTTP headers received within ${reason.timeoutMs}ms (requestTimeout). Increase 'github.copilot.llm-gateway.requestTimeout' or check the server is reachable`;
+    case 'inactivity-timeout':
+      return reason.phase === 'streaming'
+        ? `stream went idle for ${reason.timeoutMs}ms after headers arrived (requestTimeout). The server stopped sending SSE chunks mid-response — increase requestTimeout or check the upstream model`
+        : `no chunks received within ${reason.timeoutMs}ms of headers (requestTimeout)`;
+  }
 }
 
 /**
@@ -144,9 +171,25 @@ async function assertChatStreamResponseOk(response: Response): Promise<void> {
   throw new Error('Response body is null');
 }
 
+/**
+ * Minimum undici headersTimeout/bodyTimeout (5 minutes). Node's built-in
+ * `fetch` uses an undici `Agent` whose default headersTimeout is 300s. For
+ * thinking models with very long first-token latency, requestTimeout can be
+ * configured to be larger; we mirror that into undici so undici doesn't kill
+ * the connection before our own timer fires. We never go *below* 5 minutes
+ * even if requestTimeout is shorter, so we don't make undici more aggressive
+ * than its safe default.
+ */
+const UNDICI_TIMEOUT_FLOOR_MS = 300_000;
+
 export class GatewayClient {
   private config: GatewayConfig;
   private readonly log: GatewayLogger;
+  // Cached undici Agent; rebuilt when requestTimeout changes so headersTimeout
+  // tracks user configuration. Typed loosely because undici types are only
+  // available via the optional `undici` peer; we use the runtime require.
+  private dispatcher: unknown | undefined;
+  private dispatcherTimeoutMs: number | undefined;
 
   constructor(config: GatewayConfig, logger?: GatewayLogger) {
     this.config = config;
@@ -155,6 +198,40 @@ export class GatewayClient {
 
   public updateConfig(config: GatewayConfig): void {
     this.config = config;
+  }
+
+  /**
+   * Lazily build (or rebuild) an undici Agent whose headersTimeout and
+   * bodyTimeout are at least UNDICI_TIMEOUT_FLOOR_MS (5min) and grow to
+   * match requestTimeout when the user configures a longer value.
+   *
+   * Returns undefined if the undici module can't be loaded (e.g. browser
+   * environment, unsupported Node version), in which case fetch falls back
+   * to the default global dispatcher.
+   */
+  private getDispatcher(): unknown | undefined {
+    const desired = Math.max(UNDICI_TIMEOUT_FLOOR_MS, this.config.requestTimeout);
+    if (this.dispatcher && this.dispatcherTimeoutMs === desired) {
+      return this.dispatcher;
+    }
+    try {
+      // `undici` is bundled into Node's runtime; require it dynamically so
+      // we don't add a hard dependency and so esbuild leaves it external.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
+      const undici = require('undici') as { Agent: new (opts: Record<string, unknown>) => unknown };
+      this.dispatcher = new undici.Agent({
+        headersTimeout: desired,
+        bodyTimeout: desired,
+        // Leave connect/keepalive at undici defaults; we only care about the
+        // two timeouts that were biting us (UND_ERR_HEADERS_TIMEOUT).
+      });
+      this.dispatcherTimeoutMs = desired;
+      this.log(`undici Agent (re)created with headersTimeout=${desired}ms bodyTimeout=${desired}ms`);
+      return this.dispatcher;
+    } catch (err) {
+      this.log(`failed to load undici, falling back to default fetch dispatcher: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
   }
 
   /**
@@ -232,7 +309,13 @@ export class GatewayClient {
     const accumulator = new ToolCallAccumulator();
     const timers = this.createStreamTimers(cancellationToken);
 
+    // Always log the reproducible curl + dump body to tmp/llm-gateway-debug-request.json
+    // for EVERY request (not just failures), so the user can replay any
+    // request manually when troubleshooting silent hangs / slow responses.
+    // this.logReproducibleCurl(url, request);
+
     try {
+      const dispatcher = this.getDispatcher();
       const response = await fetch(url, {
         method: 'POST',
         headers: { ...this.getHeaders(), 'Content-Type': 'application/json' },
@@ -247,7 +330,10 @@ export class GatewayClient {
           stream_options: { ...(request.stream_options as object | undefined), include_usage: true },
         }),
         signal: timers.controller.signal,
-      });
+        // Node-only: pass an undici Agent so headersTimeout/bodyTimeout track
+        // the user's requestTimeout (instead of undici's hard-coded 5min).
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
 
       // Headers received — switch from the request-deadline timer to the
       // per-chunk inactivity timer so long generations aren't aborted.
@@ -263,7 +349,28 @@ export class GatewayClient {
       }
     } catch (error) {
       if (error instanceof Error) {
-        throw new Error(`Chat completion request failed: ${error.message}`);
+        const reason = timers.getAbortReason();
+        let detail = reason ? ` [${describeAbortReason(reason)}]` : '';
+        // `fetch failed` from undici is opaque — surface error.cause (low-level
+        // SystemError with code like ECONNRESET / UND_ERR_SOCKET / EPIPE) so
+        // users can diagnose vs guess.
+        if (!reason && error.message === 'fetch failed') {
+          const cause = (error as Error & { cause?: unknown }).cause;
+          if (cause instanceof Error) {
+            const code = (cause as Error & { code?: string }).code;
+            detail = ` [cause: ${cause.name}: ${cause.message}${code ? ` (code=${code})` : ''}]`;
+          } else if (cause !== undefined) {
+            detail = ` [cause: ${String(cause)}]`;
+          }
+        }
+        if (reason) {
+          this.log(`Chat stream aborted: ${describeAbortReason(reason)} (url=${url})`);
+        } else if (detail) {
+          this.log(`Chat stream error${detail} (url=${url})`);
+        }
+        // Reproducible curl was already logged at request start (see
+        // streamChatCompletion entry); no need to repeat on error.
+        throw new Error(`Chat completion request failed: ${error.message}${detail}`);
       }
       throw error;
     } finally {
@@ -317,17 +424,40 @@ export class GatewayClient {
    */
   private createStreamTimers(cancellationToken: vscode.CancellationToken): StreamTimers {
     const controller = new AbortController();
-    const cancelSub = cancellationToken.onCancellationRequested(() => controller.abort());
-    const headerTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+    const timeoutMs = this.config.requestTimeout;
+    let abortReason: AbortReason | null = null;
+    let headersReceived = false;
+
+    const abortWith = (reason: AbortReason): void => {
+      if (abortReason) { return; } // First reason wins
+      abortReason = reason;
+      controller.abort();
+    };
+
+    const cancelSub = cancellationToken.onCancellationRequested(() =>
+      abortWith({ kind: 'cancellation' })
+    );
+    const headerTimeoutId = setTimeout(
+      () => abortWith({ kind: 'header-timeout', timeoutMs }),
+      timeoutMs
+    );
     let inactivityTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const resetInactivity = (): void => {
       if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
-      inactivityTimeoutId = setTimeout(() => controller.abort(), this.config.requestTimeout);
+      inactivityTimeoutId = setTimeout(
+        () => abortWith({
+          kind: 'inactivity-timeout',
+          timeoutMs,
+          phase: headersReceived ? 'streaming' : 'pre-headers',
+        }),
+        timeoutMs
+      );
     };
     return {
       controller,
       resetInactivity,
       onHeadersReceived: () => {
+        headersReceived = true;
         clearTimeout(headerTimeoutId);
         resetInactivity();
       },
@@ -336,6 +466,7 @@ export class GatewayClient {
         if (inactivityTimeoutId) { clearTimeout(inactivityTimeoutId); }
         cancelSub.dispose();
       },
+      getAbortReason: () => abortReason,
     };
   }
 
@@ -484,6 +615,77 @@ export class GatewayClient {
   }
 
   /**
+   * Log a curl command that reproduces the chat-completion request.
+   * Sensitive header values (Authorization, Bearer tokens, API keys) are
+   * masked so the output is safe to share in bug reports. The request body
+   * is written to a workspace-local tmp file to avoid shell quoting issues
+   * with large JSON payloads.
+   */
+  private logReproducibleCurl(url: string, request: OpenAIChatCompletionRequest): void {
+    try {
+      const headers = { ...this.getHeaders(), 'Content-Type': 'application/json' };
+      const maskedHeaders = Object.entries(headers).map(([k, v]) => {
+        const lower = k.toLowerCase();
+        if (lower === 'authorization' || lower === 'x-api-key' || lower === 'api-key') {
+          return `-H '${k}: ***REDACTED***'`;
+        }
+        return `-H '${k}: ${v}'`;
+      });
+      const body = JSON.stringify({
+        ...request,
+        stream: true,
+        stream_options: { ...(request.stream_options as object | undefined), include_usage: true },
+      });
+
+      // For large bodies, write to the extension's own tmp/ directory;
+      // for smaller ones, inline. Uses __dirname (out/) to resolve the
+      // extension root so we never write into the host window's workspace.
+      const MAX_INLINE_BODY = 50000;
+      let bodyArg: string;
+      if (body.length <= MAX_INLINE_BODY) {
+        bodyArg = `-d '${body.replace(/'/g, "'\\''")}'`;
+      } else {
+        const path = require('path');
+        const fs = require('fs');
+        // __dirname is <extensionRoot>/out at runtime
+        const extensionRoot = path.resolve(__dirname, '..');
+        const debugDir = path.join(extensionRoot, 'tmp');
+        const debugPath = path.join(debugDir, 'llm-gateway-debug-request.json');
+        try {
+          fs.mkdirSync(debugDir, { recursive: true });
+          fs.writeFileSync(debugPath, body, 'utf8');
+          bodyArg = `-d @${debugPath}`;
+        } catch {
+          bodyArg = `-d @${debugPath}  # Failed to write (${body.length} chars)`;
+        }
+      }
+
+      const curl = [
+        `curl -X POST '${url}'`,
+        ...maskedHeaders,
+        bodyArg,
+      ].join(' \\\n  ');
+
+      this.log(`\n=== Reproducible curl (headers redacted) ===\n${curl}\n=== End curl ===`);
+
+      // Also log the first few messages of the body for quick inspection
+      // without needing to reconstruct the full payload.
+      const msgs = request.messages;
+      if (Array.isArray(msgs) && msgs.length > 0) {
+        const preview = msgs.slice(0, 3).map((m, i) => {
+          const role = typeof m === 'object' && m !== null ? (m as Record<string, unknown>).role : '?';
+          const toolCallId = typeof m === 'object' && m !== null ? (m as Record<string, unknown>).tool_call_id : undefined;
+          const hasToolCalls = typeof m === 'object' && m !== null && Array.isArray((m as Record<string, unknown>).tool_calls);
+          return `  [${i}] role=${role}${toolCallId ? `, tool_call_id=${toolCallId}` : ''}${hasToolCalls ? ', has_tool_calls' : ''}`;
+        });
+        this.log(`First ${Math.min(3, msgs.length)} of ${msgs.length} messages:\n${preview.join('\n')}`);
+      }
+    } catch {
+      // Best-effort — never let curl logging itself cause a failure.
+    }
+  }
+
+  /**
    * Fetch wrapper with a fixed total-request timeout and optional
    * cancellation-token wiring. Used for non-streaming requests like the
    * model list. Streaming requests manage their own timers in
@@ -499,10 +701,12 @@ export class GatewayClient {
     const cancelSub = cancellationToken?.onCancellationRequested(() => controller.abort());
 
     try {
+      const dispatcher = this.getDispatcher();
       return await fetch(url, {
         ...options,
         signal: controller.signal,
-      });
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
     } finally {
       clearTimeout(timeoutId);
       cancelSub?.dispose();

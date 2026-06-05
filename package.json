@@ -1,8 +1,8 @@
 {
-  "name": "github-copilot-llm-gateway",
-  "displayName": "GitHub Copilot LLM Gateway",
+  "name": "github-copilot-llm-gateway-v2",
+  "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.0.6",
+  "version": "1.4.1",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -90,6 +90,11 @@
         "command": "github.copilot.llm-gateway.showOutput",
         "title": "Show Output Log",
         "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.modelSettings",
+        "title": "Model Settings",
+        "category": "GitHub Copilot LLM Gateway"
       }
     ],
     "configuration": {
@@ -146,9 +151,9 @@
         },
         "github.copilot.llm-gateway.agentTemperature": {
           "type": "number",
-          "default": 0.0,
-          "minimum": 0.0,
-          "maximum": 2.0,
+          "default": 0,
+          "minimum": 0,
+          "maximum": 2,
           "description": "Temperature for agent/tool calling mode (lower = more consistent tool call formatting). Set to 0.0 for best results with fine-tuned models.",
           "order": 9
         },
@@ -157,6 +162,12 @@
           "default": false,
           "description": "When enabled, the full chat request body (including messages and tool args) is written to the output channel. Keep disabled unless you are reproducing an issue — captured logs may contain conversation content from the user's current editor.",
           "order": 10
+        },
+        "github.copilot.llm-gateway.stripConversationSummary": {
+          "type": "boolean",
+          "default": false,
+          "description": "Strip <conversation-summary> blocks injected by Copilot Chat's agent mode before sending messages to the inference server. Enable this to prevent cross-session context leaking between unrelated conversations.",
+          "order": 11
         },
         "github.copilot.llm-gateway.customHeaders": {
           "type": "object",
@@ -174,6 +185,16 @@
           "additionalProperties": true,
           "description": "Extra parameters merged into the chat-completions request body (e.g. top_k, repetition_penalty, seed). Per-request modelOptions from the caller take precedence. Edit in settings.json for non-string values.",
           "order": 12
+        },
+        "github.copilot.llm-gateway.perModelSettings": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"reasoning_effort\": \"high\" },\n  \"gpt-5.5\": { \"reasoning_effort\": \"medium\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"max_tokens\": 8192 }\n}\n```",
+          "order": 13
         }
       }
     }
@@ -187,5 +208,8 @@
     "esbuild": "^0.28.0",
     "eslint": "^10.4.0",
     "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "undici": "^8.3.0"
   }
 }

@@ -7,6 +7,8 @@ export interface OpenAIModel {
   object: string;
   created: number;
   owned_by: string;
+  /** GitHub Copilot model registry */
+  max_input_tokens?: number;
   /** vLLM, LiteLLM */
   max_model_len?: number;
   /** Ollama, LocalAI, LM Studio */
@@ -126,4 +128,6 @@ export interface GatewayConfig {
   verboseLogging: boolean;
   customHeaders: Record<string, string>;
   extraModelOptions: Record<string, unknown>;
+  perModelSettings: Record<string, Record<string, unknown>>;
+  stripConversationSummary: boolean;
 }
