@@ -388,6 +388,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
           { label: '$(globe) Copilot Proxy', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },
           { label: '$(symbol-class) Sub-agent Settings', description: 'Configure Copilot sub-agents to use Gateway models', id: 'subagentSettings' },
+          { label: '$(database) Copilot Memory Settings', description: 'Toggle Copilot Memory write/read (cross-session context)', id: 'copilotMemory' },
           { label: '$(edit) Edit Custom Headers', description: 'Manage HTTP headers (stored in secret storage)', id: 'headers' },
           { label: '$(settings-gear) Open Settings', description: 'All LLM Gateway settings', id: 'settings' },
           { label: '$(refresh) Refresh Models', description: 'Re-fetch model list from server', id: 'refresh' },
@@ -408,6 +409,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           break;
         case 'subagentSettings':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.subagentSettings');
+          break;
+        case 'copilotMemory':
+          await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotMemorySettings');
           break;
         case 'headers':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.editCustomHeaders');
@@ -581,6 +585,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   );
   context.subscriptions.push(subagentSettingsCommand);
+
+  // Copilot Memory Settings command — toggle Copilot's Memory feature
+  // (write/read) to control cross-session context transfer.
+  const copilotMemorySettingsCommand = vscode.commands.registerCommand(
+    'github.copilot.llm-gateway.copilotMemorySettings',
+    async () => {
+      await copilotMemorySettingsFlow();
+    }
+  );
+  context.subscriptions.push(copilotMemorySettingsCommand);
 
   // Auto-start if enabled in settings
   const { proxy: initialProxyConfig } = readProxyConfigs();
@@ -756,13 +770,7 @@ async function copilotProxySettingsFlow(
 // ---------- Sub-agent Settings (top-level menu) ----------
 
 interface SubagentPickItem extends vscode.QuickPickItem {
-  action:
-    | 'chooseDefault'
-    | 'toggleSearch'
-    | 'toggleExecution'
-    | 'toggleMemorySave'
-    | 'toggleMemoryLoad'
-    | 'done';
+  action: 'chooseDefault' | 'toggleSearch' | 'toggleExecution' | 'done';
 }
 
 /**
@@ -775,8 +783,6 @@ interface SubagentPickItem extends vscode.QuickPickItem {
  *   1. Default Model — chat.exploreAgent.defaultModel (with vendor suffix)
  *   2. Search Sub-agent enable/disable
  *   3. Execution Sub-agent enable/disable
- *   4. Save Copilot Memory enable/disable (memory tool — LLM stores new memories)
- *   5. Load Copilot Memory enable/disable (copilotMemory — reads stored memories into context)
  */
 async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
   while (true) {
@@ -835,34 +841,6 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
       action: 'done',
     });
 
-    // 4. Save Copilot Memory — controls the memory tool (LLM stores new memories)
-    const memorySave = readVSCodeBooleanSetting(
-      'github.copilot.chat.tools.memory.enabled',
-      true
-    );
-    items.push({
-      label: memorySave
-        ? '$(check) Save Copilot Memory: Enabled'
-        : '$(circle-slash) Save Copilot Memory: Disabled',
-      description: 'github.copilot.chat.tools.memory.enabled',
-      detail: 'Enable → LLM can save new memories via store_memory tool; Disable → no new memories',
-      action: 'toggleMemorySave',
-    });
-
-    // 5. Load Copilot Memory — controls reading stored memories into context
-    const memoryLoad = readVSCodeBooleanSetting(
-      'github.copilot.chat.copilotMemory.enabled',
-      true
-    );
-    items.push({
-      label: memoryLoad
-        ? '$(check) Load Copilot Memory: Enabled'
-        : '$(circle-slash) Load Copilot Memory: Disabled',
-      description: 'github.copilot.chat.copilotMemory.enabled',
-      detail: 'Enable → stored memories are injected into context; Disable → ignore stored memories',
-      action: 'toggleMemoryLoad',
-    });
-
     items.push({
       label: '',
       kind: vscode.QuickPickItemKind.Separator,
@@ -909,19 +887,91 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
       }
       continue;
     }
+  }
+}
 
-    if (pick.action === 'toggleMemorySave') {
+// ---------- Copilot Memory Settings (top-level menu) ----------
+
+interface MemoryPickItem extends vscode.QuickPickItem {
+  action: 'toggleWrite' | 'toggleRead' | 'done';
+}
+
+/**
+ * Copilot Memory Settings — standalone menu for managing Copilot's Memory
+ * feature. Memory is the main cross-session context-transfer mechanism in
+ * Copilot Chat (the `store_memory` tool persists info between conversations
+ * across the user/repo/session layers).
+ *
+ * Toggles:
+ *   - Write Copilot Memory → github.copilot.chat.tools.memory.enabled
+ *     Controls whether the LLM is given the `store_memory` tool.
+ *   - Read Copilot Memory  → github.copilot.chat.copilotMemory.enabled
+ *     Controls whether stored memories are injected into the chat context.
+ *
+ * Disable both to fully isolate sessions (no new memories saved, no old
+ * memories loaded).
+ */
+async function copilotMemorySettingsFlow(): Promise<void> {
+  while (true) {
+    const items: MemoryPickItem[] = [];
+
+    const writeEnabled = readVSCodeBooleanSetting(
+      'github.copilot.chat.tools.memory.enabled',
+      true
+    );
+    items.push({
+      label: writeEnabled
+        ? '$(check) Write Copilot Memory: Enabled'
+        : '$(circle-slash) Write Copilot Memory: Disabled',
+      description: 'github.copilot.chat.tools.memory.enabled',
+      detail: 'Enable → LLM can save new memories via the store_memory tool; Disable → no new memories saved',
+      action: 'toggleWrite',
+    });
+
+    const readEnabled = readVSCodeBooleanSetting(
+      'github.copilot.chat.copilotMemory.enabled',
+      true
+    );
+    items.push({
+      label: readEnabled
+        ? '$(check) Read Copilot Memory: Enabled'
+        : '$(circle-slash) Read Copilot Memory: Disabled',
+      description: 'github.copilot.chat.copilotMemory.enabled',
+      detail: 'Enable → stored memories are injected into chat context; Disable → ignore stored memories',
+      action: 'toggleRead',
+    });
+
+    items.push({
+      label: '',
+      kind: vscode.QuickPickItemKind.Separator,
+      action: 'done',
+    });
+
+    items.push({
+      label: '$(check) Done',
+      description: 'Close',
+      action: 'done',
+    });
+
+    const pick = await vscode.window.showQuickPick(items, {
+      title: 'LLM Gateway — Copilot Memory Settings',
+      placeHolder: 'Toggle Copilot Memory write/read to control cross-session context transfer',
+    });
+
+    if (!pick || pick.action === 'done') { return; }
+
+    if (pick.action === 'toggleWrite') {
       await writeVSCodeSetting(
         'github.copilot.chat.tools.memory.enabled',
-        !memorySave
+        !writeEnabled
       );
       continue;
     }
 
-    if (pick.action === 'toggleMemoryLoad') {
+    if (pick.action === 'toggleRead') {
       await writeVSCodeSetting(
         'github.copilot.chat.copilotMemory.enabled',
-        !memoryLoad
+        !readEnabled
       );
       continue;
     }

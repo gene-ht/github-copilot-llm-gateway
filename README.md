@@ -212,9 +212,7 @@ Or via the LLM Gateway status bar `→ Manage → Sub-agent Settings`:
 LLM Gateway — Sub-agent Settings
 ├── Default Model               → <selected> (copilot-llm-gateway)
 ├── Search Sub-agent            → Enabled / Disabled
-├── Execution Sub-agent         → Enabled / Disabled
-├── Save Copilot Memory         → Enabled / Disabled
-└── Load Copilot Memory         → Enabled / Disabled
+└── Execution Sub-agent         → Enabled / Disabled
 ```
 
 **Settings managed:**
@@ -227,10 +225,34 @@ LLM Gateway — Sub-agent Settings
 | `github.copilot.chat.searchSubagent.model` | Set to `""` (empty) on enable so the search sub-agent **inherits the parent request's model** (i.e. the Gateway model selected in the chat). |
 | `github.copilot.chat.executionSubagent.enabled` | Enables the `execution_subagent` tool. |
 | `github.copilot.chat.executionSubagent.model` | Set to `""` (empty) on enable so the execution sub-agent inherits the parent request's model. |
-| `github.copilot.chat.tools.memory.enabled` | **Save Copilot Memory** — whether the LLM can save new memories via the `store_memory` tool. Default `true`. Disable to prevent the LLM from creating new persistent memory entries. |
-| `github.copilot.chat.copilotMemory.enabled` | **Load Copilot Memory** — whether stored memories are injected into the conversation context. Default `true`. Disable to ignore previously stored memories (useful for fully isolating sessions). |
 
-**About Copilot Memory:** Copilot Memory is a feature where the LLM can persist information across conversations using a `store_memory` tool. Memories are stored in three layers (user/repo/session). Disabling both **Save** and **Load** prevents any cross-session context transfer through this mechanism.
+### Copilot Memory Settings
+
+Copilot Memory is the main cross-session context-transfer mechanism in Copilot Chat. The LLM can save information (TODOs, decisions, project context) via the `store_memory` tool; these memories are stored in three layers (user / repo / session) and **injected into the context of future conversations**, even unrelated ones. This is the most likely cause of "I don't know why this TODO appeared" type issues.
+
+**Manage via the Command Palette:**
+
+- `GitHub Copilot LLM Gateway: Copilot Memory Settings`
+
+Or via the LLM Gateway status bar `→ Manage → Copilot Memory Settings`:
+
+```
+LLM Gateway — Copilot Memory Settings
+├── Write Copilot Memory       → Enabled / Disabled
+└── Read Copilot Memory        → Enabled / Disabled
+```
+
+**Settings managed:**
+
+| VS Code setting | Purpose |
+|----------------|---------|
+| `github.copilot.chat.tools.memory.enabled` | **Write Copilot Memory** — whether the LLM is given the `store_memory` tool. Default `true`. Disable to prevent the LLM from creating new persistent memories. |
+| `github.copilot.chat.copilotMemory.enabled` | **Read Copilot Memory** — whether stored memories are injected into the chat context. Default `true`. Disable to ignore previously stored memories. |
+
+**To fully isolate sessions** (no new memories saved, no old memories loaded), disable both toggles. You may also want to clear existing memory files:
+
+- User-level: `globalStorageUri/memory-tool/memories/`
+- Repo-level: `storageUri/memory-tool/memories/repo/`
 
 **Why the explore agent needs the vendor suffix and the others do not:**
 
@@ -386,6 +408,7 @@ Access from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`):
 | **GitHub Copilot LLM Gateway: Model Settings**         | Per-model `reasoning_effort`, `temperature`, etc.                     |
 | **GitHub Copilot LLM Gateway: Copilot Proxy Settings** | Enable/disable the proxy + edit Copilot model → upstream model mapping |
 | **GitHub Copilot LLM Gateway: Sub-agent Settings**     | Route Copilot's Explore / Search / Execution sub-agents through Gateway |
+| **GitHub Copilot LLM Gateway: Copilot Memory Settings** | Toggle Copilot Memory write/read (control cross-session context transfer) |
 | **GitHub Copilot LLM Gateway: Show Output Log**        | Open the extension's output channel                                   |
 
 ## Privacy & Network Requests

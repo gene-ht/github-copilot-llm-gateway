@@ -2,7 +2,7 @@
   "name": "github-copilot-llm-gateway-v2",
   "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -104,6 +104,11 @@
       {
         "command": "github.copilot.llm-gateway.subagentSettings",
         "title": "Sub-agent Settings",
+        "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.copilotMemorySettings",
+        "title": "Copilot Memory Settings",
         "category": "GitHub Copilot LLM Gateway"
       }
     ],
