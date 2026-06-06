@@ -129,5 +129,6 @@ export interface GatewayConfig {
   customHeaders: Record<string, string>;
   extraModelOptions: Record<string, unknown>;
   perModelSettings: Record<string, Record<string, unknown>>;
-  stripConversationSummary: boolean;
+  stripFakeToolCallText: boolean;
+  retryFakeToolCalls: boolean;
 }

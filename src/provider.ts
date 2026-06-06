@@ -6,8 +6,10 @@ import {
   NormalizedMessage,
   NormalizedPart,
   NormalizedRole,
-  stripConversationSummary,
+  stripFakeToolCallText,
+  containsFakeToolCallText,
 } from './messageConverter';
+import { parseFakeToolCalls } from './fakeToolCallParser';
 import {
   TOKEN_CONSTANTS,
   buildInputText,
@@ -592,8 +594,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // verboseLogging so it captures real-world incidents without setup.
     this.detectCrossSessionInjection(openAIMessages, messages.length);
 
-    if (this.config.stripConversationSummary) {
-      openAIMessages = stripConversationSummary(openAIMessages, (msg) =>
+    if (this.config.stripFakeToolCallText) {
+      openAIMessages = stripFakeToolCallText(openAIMessages, (msg) =>
         this.outputChannel.appendLine(msg)
       );
     }
@@ -779,12 +781,120 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         reporter,
         isCancelled: () => token.isCancellationRequested,
         resolveToolCallArgs: (toolCall) => this.resolveToolCallArgs(toolCall, toolSchemas),
+        captureContent: hasTools && this.config.retryFakeToolCalls,
       });
 
       if (this.config.verboseLogging) {
         this.outputChannel.appendLine(
           `Completed chat request, received ${stats.totalContentLength} chars, ${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls`
         );
+      }
+
+      // Detect self-poisoning: model wrote tool calls as plain text instead of
+      // using the structured tool_calls mechanism. Recovery strategy:
+      //   1. PARSE the text — if we can extract structured tool calls from
+      //      the "Completed tool calls:" block, emit them directly. This is
+      //      a synthetic reconstruction; it works even when the upstream
+      //      rejects `tool_choice="required"` (e.g. GitHub Copilot's backend
+      //      caps Required mode to a single tool).
+      //   2. If parsing fails (malformed JSON, unrecognized format), fall
+      //      back to a retry with a strong correction prompt. We don't use
+      //      `tool_choice="required"` because it's not portable across
+      //      OpenAI-compatible backends.
+      if (
+        this.config.retryFakeToolCalls &&
+        hasTools &&
+        stats.totalToolCalls === 0 &&
+        stats.capturedContent &&
+        containsFakeToolCallText(stats.capturedContent) &&
+        !token.isCancellationRequested
+      ) {
+        // -------- Step 1: try to reconstruct tool_calls from text --------
+        const parsed = parseFakeToolCalls(stats.capturedContent);
+        if (parsed.length > 0) {
+          this.outputChannel.appendLine(
+            `WARNING: Model wrote tool calls as plain text. ` +
+            `Parsed ${parsed.length} tool call(s) from text; emitting as structured tool_calls.`
+          );
+          for (const tc of parsed) {
+            const args = this.resolveToolCallArgs(
+              { id: tc.id, name: tc.name, arguments: tc.arguments },
+              toolSchemas
+            );
+            if (this.config.verboseLogging) {
+              this.outputChannel.appendLine(
+                `  Synthesized tool call: ${tc.name} (id=${tc.id})`
+              );
+            }
+            reporter.reportToolCall(tc.id, tc.name, args);
+            stats.totalToolCalls++;
+          }
+          this.outputChannel.appendLine(
+            `Synthesized ${parsed.length} tool call(s) from text-mode output ✓`
+          );
+        } else {
+          // -------- Step 2: parsing failed → retry with correction --------
+          this.outputChannel.appendLine(
+            `WARNING: Model wrote tool calls as plain text (${stats.totalContentLength} chars, 0 real tool_calls) ` +
+            `but parsing failed. Falling back to retry with correction prompt.`
+          );
+
+          const correctionSystem: OpenAIMessage = {
+            role: 'system',
+            content:
+              'CRITICAL: You must use the function-calling (tool_calls) mechanism to invoke tools. ' +
+              'NEVER write tool calls as plain text, markdown, or any human-readable format. ' +
+              'The user CANNOT execute text descriptions of tool calls — only structured tool_calls ' +
+              'are actually executed. If you need to call a tool, emit a real tool_call; do not narrate it.',
+          };
+          const retryMessages: OpenAIMessage[] = [
+            correctionSystem,
+            ...requestOptions.messages,
+            { role: 'assistant', content: stats.capturedContent },
+            {
+              role: 'user',
+              content:
+                'STOP. You just described tool calls as plain text. Those were NOT executed. ' +
+                'Re-invoke the exact same tools you just described, but this time use the function ' +
+                'calling mechanism so they actually run. Do not output any text — just call the tools.',
+            },
+          ];
+
+          // Note: NOT setting tool_choice="required" — GitHub Copilot's
+          // backend rejects it when >1 tool is in the request, and most
+          // OpenAI-compatible servers vary in support. The prompt + system
+          // message is the only portable lever.
+          const retryRequest: OpenAIChatCompletionRequest = {
+            ...requestOptions,
+            messages: retryMessages,
+          };
+
+          if (this.config.verboseLogging) {
+            this.outputChannel.appendLine(
+              `Retry request: ${retryMessages.length} messages (was ${requestOptions.messages.length})`
+            );
+          }
+
+          const retryChunks = this.client.streamChatCompletion(retryRequest, token);
+          const retryStats = await streamResponse({
+            chunks: retryChunks as AsyncIterable<StreamChunk>,
+            reporter,
+            isCancelled: () => token.isCancellationRequested,
+            resolveToolCallArgs: (toolCall) => this.resolveToolCallArgs(toolCall, toolSchemas),
+          });
+
+          if (retryStats.totalToolCalls > 0) {
+            this.outputChannel.appendLine(
+              `Retry recovered ${retryStats.totalToolCalls} real tool call(s) ✓`
+            );
+          } else {
+            this.outputChannel.appendLine(
+              `WARNING: Retry did not recover tool calls — model may be stuck in text mode. ` +
+              `Likely cause: context too large (${requestOptions.messages.length} messages) for reliable tool calling. ` +
+              `Consider starting a new chat session.`
+            );
+          }
+        }
       }
 
       if (isEmptyStreamResult(stats)) {
@@ -875,6 +985,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    */
   public showOutput(): void {
     this.outputChannel.show();
+  }
+
+  /** Expose the output channel so the proxy server can log alongside the provider. */
+  public getOutputChannel(): vscode.OutputChannel {
+    return this.outputChannel;
+  }
+
+  /**
+   * Return the effective API key after resolving framework overrides and
+   * SecretStorage cache. Used by the Copilot proxy to authenticate with
+   * the upstream server without duplicating the resolution logic.
+   */
+  public getResolvedApiKey(): string {
+    return this.config.apiKey ?? '';
   }
 
   /**
@@ -1177,25 +1301,26 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   // ---------- logging helpers ----------
 
   /**
-   * Always-on detector for Copilot Chat's cross-session injection.
+   * Detector for self-poisoning patterns in assistant message content.
    *
-   * Scans converted OpenAI messages for known markers (`<conversation-summary>`,
-   * `<system-reminder>`, top-level TODO blocks, etc.). When a marker is found,
-   * logs a one-line summary so users can correlate "unexpected TODO appeared"
-   * incidents with the actual injected content.
+   * Specifically: when an assistant message includes a textual representation
+   * of "Completed tool calls: - foo (call_xxx) { ... }" (as some Copilot Chat
+   * clients do for human-readable replay), it can act as a few-shot example
+   * teaching the model to *write* tool calls as text instead of emitting a
+   * real tool_calls array. We log when this is detected so users can correlate
+   * "model stopped calling tools" with the actual injected text.
    *
-   * Runs regardless of `verboseLogging` because cross-session leak detection
-   * needs to capture incidents in normal use, not just during debug sessions.
+   * Runs regardless of `verboseLogging` — detection needs to capture incidents
+   * in normal use, not just during debug sessions. Conversation-summary blocks
+   * are NOT detected here (they're a normal in-session context compression
+   * mechanism, not pollution).
    */
   private detectCrossSessionInjection(
     openAIMessages: readonly OpenAIMessage[],
     vsCodeMessageCount: number
   ): void {
     const markers: Array<{ name: string; regex: RegExp; count: number; firstHit?: { msgIndex: number; snippet: string } }> = [
-      { name: '<conversation-summary>', regex: /<conversation-summary>/g, count: 0 },
-      { name: '<system-reminder>', regex: /<system-reminder>/g, count: 0 },
-      { name: '<previous-conversation>', regex: /<previous-conversation>/g, count: 0 },
-      { name: 'conversation_summary', regex: /conversation_summary/g, count: 0 },
+      { name: 'Completed tool calls (fake-toolcall self-poisoning)', regex: /Completed tool calls:\s*\n[ \t]*-[ \t]+\S+[ \t]*\(call_[0-9a-zA-Z]+\)/g, count: 0 },
     ];
 
     for (let i = 0; i < openAIMessages.length; i++) {
@@ -1237,7 +1362,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     if (triggered.length === 0) { return; }
 
     this.outputChannel.appendLine(
-      `[Cross-session detector] Detected injection markers in request (${vsCodeMessageCount} messages):`
+      `[Self-poisoning detector] Detected fake-toolcall markers in request (${vsCodeMessageCount} messages):`
     );
     for (const m of triggered) {
       this.outputChannel.appendLine(
@@ -1431,7 +1556,8 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       customHeaders: { ...this.secretCache.customHeaders },
       extraModelOptions: config.get<Record<string, unknown>>('extraModelOptions', {}) ?? {},
       perModelSettings: config.get<Record<string, Record<string, unknown>>>('perModelSettings', {}) ?? {},
-      stripConversationSummary: config.get<boolean>('stripConversationSummary', false),
+      stripFakeToolCallText: config.get<boolean>('stripFakeToolCallText', true),
+      retryFakeToolCalls: config.get<boolean>('retryFakeToolCalls', true),
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)

@@ -177,23 +177,60 @@ export function convertMessages(
   return result;
 }
 
-/**
- * Regex that matches `<conversation-summary>...</conversation-summary>` blocks
- * (including multiline content). Used by {@link stripConversationSummary}.
- */
-const CONVERSATION_SUMMARY_RE = /<conversation-summary>[\s\S]*?<\/conversation-summary>/g;
 
 /**
- * Strip `<conversation-summary>` XML blocks from OpenAI message content.
+ * Regex that matches Copilot Chat's "Completed tool calls" textual summary
+ * blocks inside assistant content. Format observed in the wild:
  *
- * Copilot Chat's agent mode injects cross-session summaries into the messages
- * passed to the provider. These can leak context between unrelated sessions.
- * This post-processing step removes those blocks so each session starts clean.
+ *     Completed tool calls:
+ *     - read_file (call_91e3b9d70b8c4be0a4d3c1f7) {"endLine":205,...}
+ *     - replace_string_in_file (call_a6f7e54b2eaa4b9c812a2cae) {"filePath":...}
  *
- * Only affects `role: user` messages with string content. Messages that become
- * empty after stripping are dropped entirely.
+ * The block is rendered for human-readable history but, when it round-trips
+ * back into the next request's `messages[]`, it acts as a few-shot example
+ * teaching the model to *write* tool calls as text instead of emitting a
+ * real `tool_calls` array. The resulting self-poisoning loop is the failure
+ * mode this regex breaks.
+ *
+ * Conservative on purpose: requires the literal header and at least one
+ * `- name (call_<hex>) {...}` bullet. Won't touch normal markdown lists or
+ * legitimate code blocks.
  */
-export function stripConversationSummary(
+const FAKE_TOOL_CALL_TEXT_RE =
+  /\n*Completed tool calls:\s*\n(?:[ \t]*-[ \t]+\S+[ \t]*\(call_[0-9a-zA-Z]+\)[ \t]*\{[\s\S]*?\}[ \t]*\n?)+/g;
+
+/**
+ * Returns true when the given text contains a "Completed tool calls" block
+ * in the format Copilot Chat's history serializer uses. Useful for detecting
+ * self-poisoning in streaming output *before* the text is fed back into
+ * history.
+ */
+export function containsFakeToolCallText(text: string): boolean {
+  FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+  const result = FAKE_TOOL_CALL_TEXT_RE.test(text);
+  FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+  return result;
+}
+
+/**
+ * Strip "Completed tool calls: …" textual summaries from assistant content.
+ *
+ * Some Copilot Chat clients/agents embed a human-readable summary of executed
+ * tool calls into the assistant message's `content` *in addition to* (or
+ * sometimes instead of) the structured `tool_calls` field. When that text is
+ * fed back in subsequent turns, models — especially under long contexts —
+ * start mimicking the format and emit tool calls as plain text, skipping
+ * actual execution.
+ *
+ * Removing the textual block leaves the structured `tool_calls` field intact
+ * (this function never touches it), so real tool-call semantics are preserved
+ * while the few-shot poisoning trigger is removed.
+ *
+ * Only affects assistant messages with string content. Messages that become
+ * empty after stripping are dropped entirely (rare — usually the assistant
+ * also has its own analysis text).
+ */
+export function stripFakeToolCallText(
   messages: readonly OpenAIMessage[],
   log: ConverterLogger = NOOP_LOGGER
 ): OpenAIMessage[] {
@@ -204,22 +241,34 @@ export function stripConversationSummary(
     const role = (msg as Record<string, unknown>).role;
     const content = (msg as Record<string, unknown>).content;
 
-    if (role === 'user' && typeof content === 'string' && CONVERSATION_SUMMARY_RE.test(content)) {
-      const cleaned = content.replace(CONVERSATION_SUMMARY_RE, '').trim();
-      strippedCount++;
-      if (cleaned.length > 0) {
-        result.push({ ...msg, content: cleaned });
-      }
-      // Reset regex lastIndex since we used the global flag
-      CONVERSATION_SUMMARY_RE.lastIndex = 0;
+    if (role !== 'assistant' || typeof content !== 'string') {
+      result.push(msg);
       continue;
     }
 
-    result.push(msg);
+    FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+    if (!FAKE_TOOL_CALL_TEXT_RE.test(content)) {
+      result.push(msg);
+      continue;
+    }
+
+    FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+    const cleaned = content.replace(FAKE_TOOL_CALL_TEXT_RE, '\n').trim();
+    strippedCount++;
+
+    // If the assistant message had a real tool_calls field, keep it even
+    // when the human-readable part became empty — the structured call is
+    // what actually drives the next-turn tool/role message.
+    const hasToolCalls = Array.isArray((msg as Record<string, unknown>).tool_calls)
+      && ((msg as Record<string, unknown>).tool_calls as unknown[]).length > 0;
+
+    if (cleaned.length > 0 || hasToolCalls) {
+      result.push({ ...msg, content: cleaned });
+    }
   }
 
   if (strippedCount > 0) {
-    log(`Stripped <conversation-summary> from ${strippedCount} message(s)`);
+    log(`Stripped "Completed tool calls" text from ${strippedCount} assistant message(s)`);
   }
   return result;
 }

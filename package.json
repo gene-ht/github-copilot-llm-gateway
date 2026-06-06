@@ -2,7 +2,7 @@
   "name": "github-copilot-llm-gateway-v2",
   "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.4.1",
+  "version": "1.5.2",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -95,6 +95,16 @@
         "command": "github.copilot.llm-gateway.modelSettings",
         "title": "Model Settings",
         "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.copilotProxySettings",
+        "title": "Copilot Proxy Settings",
+        "category": "GitHub Copilot LLM Gateway"
+      },
+      {
+        "command": "github.copilot.llm-gateway.subagentSettings",
+        "title": "Sub-agent Settings",
+        "category": "GitHub Copilot LLM Gateway"
       }
     ],
     "configuration": {
@@ -163,11 +173,17 @@
           "description": "When enabled, the full chat request body (including messages and tool args) is written to the output channel. Keep disabled unless you are reproducing an issue — captured logs may contain conversation content from the user's current editor.",
           "order": 10
         },
-        "github.copilot.llm-gateway.stripConversationSummary": {
+        "github.copilot.llm-gateway.stripFakeToolCallText": {
           "type": "boolean",
-          "default": false,
-          "description": "Strip <conversation-summary> blocks injected by Copilot Chat's agent mode before sending messages to the inference server. Enable this to prevent cross-session context leaking between unrelated conversations.",
+          "default": true,
+          "description": "Strip 'Completed tool calls: …' textual summary blocks from assistant content. Some Copilot Chat clients embed a human-readable summary of executed tool calls into assistant.content; when fed back as history, this acts as a few-shot example that teaches the model to *write* tool calls as text instead of emitting a real tool_calls array (especially under long contexts). Removing the text breaks the self-poisoning loop while leaving the structured tool_calls field intact.",
           "order": 11
+        },
+        "github.copilot.llm-gateway.retryFakeToolCalls": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the model writes tool calls as plain text instead of using the function calling mechanism, automatically inject a correction prompt and retry the request. This recovers tool execution in the current turn rather than waiting for history cleanup in the next turn. Only one retry is attempted to avoid infinite loops.",
+          "order": 12
         },
         "github.copilot.llm-gateway.customHeaders": {
           "type": "object",
@@ -195,6 +211,21 @@
           },
           "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"reasoning_effort\": \"high\" },\n  \"gpt-5.5\": { \"reasoning_effort\": \"medium\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"max_tokens\": 8192 }\n}\n```",
           "order": 13
+        },
+        "github.copilot.llm-gateway.copilotProxy.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Start a local HTTP proxy server so Copilot's background services (title generation, summarization, intent classification, commit messages, etc.) are forwarded to the upstream inference server instead of `api.githubcopilot.com`.\n\nWhen enabled, the extension automatically sets `github.copilot.advanced.debug.overrideProxyUrl` to point at the local proxy.",
+          "order": 20
+        },
+        "github.copilot.llm-gateway.copilotProxy.modelMapping": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "Map Copilot model names to upstream model names for the proxy server. Use the **Copilot Proxy Settings** command to pick from available upstream models.\n\nExample:\n```json\n{\n  \"gpt-4o-mini\": \"your-fast-model\",\n  \"gpt-4.1-2025-04-14\": \"your-main-model\"\n}\n```",
+          "order": 21
         }
       }
     }

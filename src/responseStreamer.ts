@@ -46,6 +46,13 @@ export interface StreamStats {
    * don't need to pass it.
    */
   reportedUsage?: boolean;
+  /**
+   * When `captureContent` is enabled, all visible content text (text parts,
+   * not thinking) is accumulated here so the caller can inspect the full
+   * response for patterns like fake tool-call text after the stream ends.
+   * Capped at 20 KB to avoid unbounded memory in long-running responses.
+   */
+  capturedContent?: string;
 }
 
 export interface StreamResponseParams {
@@ -53,6 +60,13 @@ export interface StreamResponseParams {
   reporter: StreamReporter;
   /** Called before reading each chunk; return true to stop early. */
   isCancelled: () => boolean;
+  /**
+   * When true, accumulate all visible content text into
+   * {@link StreamStats.capturedContent} so the caller can inspect the full
+   * response for self-poisoning patterns after the stream ends.
+   * Defaults to false to avoid unnecessary memory usage.
+   */
+  captureContent?: boolean;
   /**
    * Called with each finished tool call. The callback is responsible for
    * JSON-repairing the arguments and filling any missing required properties
@@ -152,8 +166,9 @@ function processStreamChunk(
  * use to decide whether the response was empty and needs an error fallback.
  */
 export async function streamResponse(params: StreamResponseParams): Promise<StreamStats> {
-  const { chunks, reporter, isCancelled, resolveToolCallArgs } = params;
+  const { chunks, reporter, isCancelled, resolveToolCallArgs, captureContent } = params;
 
+  const CAPTURE_LIMIT = 20_000; // Cap captured content to avoid unbounded memory
   const stats: StreamStats = {
     totalContentLength: 0,
     totalToolCalls: 0,
@@ -161,6 +176,7 @@ export async function streamResponse(params: StreamResponseParams): Promise<Stre
     hadThinking: false,
     thinkingForceClosed: false,
     reportedUsage: false,
+    ...(captureContent ? { capturedContent: '' } : {}),
   };
 
   const parser = new ThinkingParser();
@@ -173,6 +189,15 @@ export async function streamResponse(params: StreamResponseParams): Promise<Stre
     inReasoningField = processStreamChunk(
       chunk, parser, reporter, stats, inReasoningField, resolveToolCallArgs
     );
+
+    // Accumulate visible text for post-stream analysis (e.g. fake-tool-call
+    // detection). Capped to CAPTURE_LIMIT to bound memory.
+    if (captureContent && chunk.content && stats.capturedContent !== undefined
+      && stats.capturedContent.length < CAPTURE_LIMIT) {
+      stats.capturedContent += chunk.content.slice(
+        0, CAPTURE_LIMIT - stats.capturedContent.length
+      );
+    }
   }
 
   // Flush any remaining buffered content. 'E' pieces here signal that the

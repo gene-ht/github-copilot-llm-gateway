@@ -309,10 +309,10 @@ export class GatewayClient {
     const accumulator = new ToolCallAccumulator();
     const timers = this.createStreamTimers(cancellationToken);
 
-    // Always log the reproducible curl + dump body to tmp/llm-gateway-debug-request.json
-    // for EVERY request (not just failures), so the user can replay any
-    // request manually when troubleshooting silent hangs / slow responses.
-    // this.logReproducibleCurl(url, request);
+    // Reproducible curl + body dump is logged only on error (see catch block).
+    // Logging on every request floods the output channel and rewrites the
+    // workspace-local tmp/llm-gateway-debug-request.json file each turn, which
+    // is noisy and risks leaking conversation content in normal sessions.
 
     try {
       const dispatcher = this.getDispatcher();
@@ -368,8 +368,12 @@ export class GatewayClient {
         } else if (detail) {
           this.log(`Chat stream error${detail} (url=${url})`);
         }
-        // Reproducible curl was already logged at request start (see
-        // streamChatCompletion entry); no need to repeat on error.
+        // Log the reproducible curl + dump body now, on error, so the user
+        // can replay the failing request manually. We skip user-cancellation
+        // aborts because they aren't actionable bugs.
+        if (!reason || reason.kind !== 'cancellation') {
+          this.logReproducibleCurl(url, request);
+        }
         throw new Error(`Chat completion request failed: ${error.message}${detail}`);
       }
       throw error;

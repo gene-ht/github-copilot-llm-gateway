@@ -153,6 +153,113 @@ These settings control how the extension handles agentic features like code edit
 | -------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Verbose Logging**  | `false` | When enabled, the full request body (including messages and tool args) is written to the output channel. Keep disabled unless debugging an issue. |
 
+## Copilot Proxy & Sub-agent Settings
+
+By default, GitHub Copilot's **background services** (commit-message generation, conversation title generation, intent classification, sub-agent tasks, etc.) bypass the Language Model API entirely and call `api.githubcopilot.com` directly via Copilot's internal HTTP client. When your Copilot quota is exhausted, all these features fail — even if you've selected an LLM Gateway model for your main chat.
+
+This extension solves this in two complementary ways:
+
+### Background Service Routing (HTTP Proxy)
+
+A local HTTP proxy server intercepts Copilot's CAPI requests (`/chat/completions`, `/v1/messages`) and forwards them to your upstream LLM, mapping Copilot's internal model names (e.g. `gpt-4o-mini` for `copilot-fast`) to upstream models you choose.
+
+**Manage via the Command Palette:**
+
+- `GitHub Copilot LLM Gateway: Copilot Proxy Settings`
+
+Or via the LLM Gateway status bar `→ Manage → Copilot Proxy`:
+
+```
+LLM Gateway — Copilot Proxy
+├── Enable / Disable Proxy
+├── copilot-fast        → mapped upstream model    (gpt-4o-mini)
+├── copilot-base        → mapped upstream model    (gpt-4.1-2025-04-14)
+├── <custom mappings>   → mapped upstream model
+└── Add custom model mapping...
+```
+
+**What happens when enabled:**
+
+1. Local HTTP server starts on `127.0.0.1:<auto-port>`
+2. `github.copilot.advanced.debug.overrideCapiUrl` and `overrideProxyUrl` are written to your user `settings.json`, redirecting Copilot's HTTP traffic to the local proxy
+3. `POST /chat/completions` requests → mapped + forwarded to upstream `/v1/chat/completions` (OpenAI format)
+4. `POST /v1/messages` requests → mapped + forwarded to upstream `/v1/messages` (Anthropic format)
+5. All other Copilot requests (authentication, model list, agents, etc.) are transparently passed through to `api.githubcopilot.com`
+
+**Model mappings:**
+
+| Copilot internal name | Used by | Maps to |
+|----------------------|---------|---------|
+| `copilot-fast` / `gpt-4o-mini` | Title, summary, classify, commit message, etc. | Any upstream model you choose |
+| `copilot-base` / `gpt-4.1-2025-04-14` | Some chat requests | Any upstream model you choose |
+| Custom | Anything else Copilot sends | Any upstream model you choose |
+
+The mapping supports prefix matching, so `gpt-4o-mini-2024-07-18` automatically matches the `gpt-4o-mini` mapping.
+
+When disabled, both `overrideCapiUrl` and `overrideProxyUrl` are cleared from your `settings.json` and Copilot reverts to its default endpoints.
+
+### Sub-agent Routing (LanguageModelChat API)
+
+Copilot's sub-agents — **Explore Agent** (code research), **Search Sub-agent** (semantic search), and **Execution Sub-agent** (background execution) — call the `vscode.lm` API directly. They route through Gateway's `LanguageModelChatProvider` (independent of the HTTP proxy) when configured to use Gateway-provided models.
+
+**Manage via the Command Palette:**
+
+- `GitHub Copilot LLM Gateway: Sub-agent Settings`
+
+Or via the LLM Gateway status bar `→ Manage → Sub-agent Settings`:
+
+```
+LLM Gateway — Sub-agent Settings
+├── Default Model               → <selected> (copilot-llm-gateway)
+├── Search Sub-agent            → Enabled / Disabled
+├── Execution Sub-agent         → Enabled / Disabled
+├── Save Copilot Memory         → Enabled / Disabled
+└── Load Copilot Memory         → Enabled / Disabled
+```
+
+**Settings managed:**
+
+| VS Code setting | Purpose |
+|----------------|---------|
+| `chat.exploreAgent.defaultModel` | The default model for the **Explore Agent** (code research sub-agent). Written in `"<id> (copilot-llm-gateway)"` format so VS Code's model resolver picks the Gateway-vendor model instead of Copilot's same-named model. |
+| `github.copilot.chat.searchSubagent.enabled` | Enables the `search_subagent` tool. When toggled on, also forces `useAgenticProxy=false` so the search sub-agent uses your Gateway model instead of GitHub's `agentic-search` service. |
+| `github.copilot.chat.searchSubagent.useAgenticProxy` | Auto-set to `false` on enable. Set to `true` would route search through GitHub's dedicated `agentic-search-v3` service (bypassing Gateway). |
+| `github.copilot.chat.searchSubagent.model` | Set to `""` (empty) on enable so the search sub-agent **inherits the parent request's model** (i.e. the Gateway model selected in the chat). |
+| `github.copilot.chat.executionSubagent.enabled` | Enables the `execution_subagent` tool. |
+| `github.copilot.chat.executionSubagent.model` | Set to `""` (empty) on enable so the execution sub-agent inherits the parent request's model. |
+| `github.copilot.chat.tools.memory.enabled` | **Save Copilot Memory** — whether the LLM can save new memories via the `store_memory` tool. Default `true`. Disable to prevent the LLM from creating new persistent memory entries. |
+| `github.copilot.chat.copilotMemory.enabled` | **Load Copilot Memory** — whether stored memories are injected into the conversation context. Default `true`. Disable to ignore previously stored memories (useful for fully isolating sessions). |
+
+**About Copilot Memory:** Copilot Memory is a feature where the LLM can persist information across conversations using a `store_memory` tool. Memories are stored in three layers (user/repo/session). Disabling both **Save** and **Load** prevents any cross-session context transfer through this mechanism.
+
+**Why the explore agent needs the vendor suffix and the others do not:**
+
+`chat.exploreAgent.defaultModel` is resolved by VS Code core via `vscode.lm.selectChatModels()`, which supports the `"<name> (<vendor>)"` syntax for disambiguating identically-named models across vendors. Both Copilot and Gateway register a model called `claude-opus-4.6-1m` — without the `(copilot-llm-gateway)` suffix, VS Code would pick Copilot's version, which goes to `api.githubcopilot.com`. The `searchSubagent` and `executionSubagent` settings do not support this syntax; instead, leaving them empty causes them to fall back to the parent request's model, which is your Gateway model.
+
+### Combined Architecture
+
+```
+Copilot Chat (you select a Gateway model)
+│
+├── Main chat request
+│   → vscode.lm API → Gateway LanguageModelChatProvider → upstream LLM
+│
+├── Sub-agents (Explore, Search, Execution)
+│   → vscode.lm API → Gateway LanguageModelChatProvider → upstream LLM
+│   (configured via Sub-agent Settings)
+│
+└── Background services (commit message, title, summary, etc.)
+    → CAPI endpoint → overrideCapiUrl → local HTTP proxy
+    → model mapping → upstream LLM
+    (configured via Copilot Proxy Settings)
+```
+
+### Known Limitations
+
+- **CopilotCLI HMAC errors**: The Copilot CLI subprocess uses HMAC-signed requests that fail validation when passed through the proxy. These errors appear in the Copilot output channel but do not affect the VS Code extension's functionality.
+- **Sub-agent model picker**: Sub-agents pick their model on each invocation. If you set the Search Sub-agent to "Enabled" but use a Copilot-vendor model (not Gateway) for the parent chat, the search will still route through Copilot.
+- **Copilot quota dialogs**: The proxy cannot suppress UI dialogs that Copilot shows when it detects an exhausted GitHub quota, even when the actual requests are being routed elsewhere.
+
 ## Recommended Models
 
 These models have been tested with good tool calling support:
@@ -270,10 +377,16 @@ The model outputs text like "Using the read_file tool..." instead of actually ca
 
 Access from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`):
 
-| Command                                                | Description                                           |
-| ------------------------------------------------------ | ----------------------------------------------------- |
-| **GitHub Copilot LLM Gateway: Test Server Connection** | Test connectivity and list available models          |
-| **GitHub Copilot LLM Gateway: Refresh Models**         | Re-probe the inference server and refresh the picker |
+| Command                                                | Description                                                           |
+| ------------------------------------------------------ | --------------------------------------------------------------------- |
+| **GitHub Copilot LLM Gateway: Test Server Connection** | Test connectivity and list available models                           |
+| **GitHub Copilot LLM Gateway: Refresh Models**         | Re-probe the inference server and refresh the picker                  |
+| **GitHub Copilot LLM Gateway: Configure Server**       | Set server URL + API key (stored in secret storage)                   |
+| **GitHub Copilot LLM Gateway: Edit Custom Headers**    | Manage custom HTTP headers sent to the inference server                |
+| **GitHub Copilot LLM Gateway: Model Settings**         | Per-model `reasoning_effort`, `temperature`, etc.                     |
+| **GitHub Copilot LLM Gateway: Copilot Proxy Settings** | Enable/disable the proxy + edit Copilot model → upstream model mapping |
+| **GitHub Copilot LLM Gateway: Sub-agent Settings**     | Route Copilot's Explore / Search / Execution sub-agents through Gateway |
+| **GitHub Copilot LLM Gateway: Show Output Log**        | Open the extension's output channel                                   |
 
 ## Privacy & Network Requests
 
