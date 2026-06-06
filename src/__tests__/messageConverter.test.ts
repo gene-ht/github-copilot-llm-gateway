@@ -6,6 +6,8 @@ import {
   encodeImageAsDataUrl,
   NormalizedMessage,
   NormalizedPart,
+  stripFakeToolCallText,
+  containsFakeToolCallText,
 } from '../messageConverter';
 
 const WITH_IMAGES = { enableImageInput: true };
@@ -240,5 +242,169 @@ describe('convertMessages', () => {
     // If a new kind is added, this assertion will break, nudging maintainers
     // to handle it in convertMessage().
     assert.equal(usedPartKinds.length, 5);
+  });
+});
+
+describe('stripFakeToolCallText', () => {
+  test('passes through messages without the marker untouched', () => {
+    const messages = [
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'sure, doing it' },
+      { role: 'tool', tool_call_id: 'call_abc', content: 'result' },
+    ];
+    const out = stripFakeToolCallText(messages);
+    assert.deepEqual(out, messages);
+  });
+
+  test('strips the "Completed tool calls" block from assistant text (idx-535 form)', () => {
+    // Pure-text "fake" tool call: the seed of the self-poisoning loop.
+    const polluted =
+      '`KnowledgePanel.tsx` deep uses currentStage…\n\nCompleted tool calls:\n- read_file (call_91e3b9d70b8c4be0a4d3c1f7) {"endLine":205,"filePath":"/x/y.tsx","startLine":170}\n';
+    const out = stripFakeToolCallText([{ role: 'assistant', content: polluted }]);
+    assert.equal(out.length, 1);
+    const cleaned = (out[0] as { content: string }).content;
+    assert.ok(!/Completed tool calls/.test(cleaned), 'header still present');
+    assert.ok(!/call_91e3b9d70b8c4be0a4d3c1f7/.test(cleaned), 'call id still present');
+    assert.ok(/KnowledgePanel\.tsx/.test(cleaned), 'human-readable prose was stripped');
+  });
+
+  test('preserves real tool_calls when stripping coexisting text block (idx-537 form)', () => {
+    // Hybrid: model emitted real tool_calls AND echoed them as text. We must
+    // strip only the text — losing tool_calls would orphan the next tool turn.
+    const realToolCall = {
+      id: 'call_a6f7e54b2eaa4b9c812a2cae',
+      type: 'function',
+      function: { name: 'replace_string_in_file', arguments: '{"filePath":"/x/y.tsx"}' },
+    };
+    const msg = {
+      role: 'assistant',
+      content:
+        '读到了 FewshotSection 顶部。\n\nCompleted tool calls:\n- replace_string_in_file (call_a6f7e54b2eaa4b9c812a2cae) {"filePath":"/x/y.tsx"}\n',
+      tool_calls: [realToolCall],
+    };
+    const out = stripFakeToolCallText([msg]);
+    assert.equal(out.length, 1);
+    const cleaned = out[0] as { content: string; tool_calls: unknown[] };
+    assert.ok(!/Completed tool calls/.test(cleaned.content));
+    assert.deepEqual(cleaned.tool_calls, [realToolCall], 'real tool_calls must survive');
+    assert.ok(/FewshotSection/.test(cleaned.content));
+  });
+
+  test('keeps message when content becomes empty but tool_calls remain', () => {
+    // Edge case: the assistant only wrote the fake summary and nothing else,
+    // but the structured tool_calls field is still there. Dropping the
+    // message would break the tool_call_id <-> next tool message linkage.
+    const realToolCall = {
+      id: 'call_deadbeef00000000000000',
+      type: 'function',
+      function: { name: 'read_file', arguments: '{}' },
+    };
+    const out = stripFakeToolCallText([
+      {
+        role: 'assistant',
+        content: 'Completed tool calls:\n- read_file (call_deadbeef00000000000000) {}\n',
+        tool_calls: [realToolCall],
+      },
+    ]);
+    assert.equal(out.length, 1, 'message must be retained for tool_call_id linkage');
+    assert.equal((out[0] as { content: string }).content, '');
+  });
+
+  test('drops fully-empty assistant message with no tool_calls', () => {
+    // Pure pollution, nothing to keep. Removing it shortens history without
+    // breaking any tool_call_id linkage (there was none).
+    const out = stripFakeToolCallText([
+      {
+        role: 'assistant',
+        content: 'Completed tool calls:\n- foo (call_aaaaaaaaaaaaaaaaaaaaaaaa) {}\n',
+      },
+    ]);
+    assert.equal(out.length, 0);
+  });
+
+  test('does not touch user or tool messages even if they contain the marker', () => {
+    // Conservative scope: only assistant.content is the poisoning vector;
+    // user/tool messages with that string (e.g., a user pasting a transcript)
+    // should pass through verbatim.
+    const messages = [
+      { role: 'user', content: 'Completed tool calls:\n- foo (call_xxxxxxxxxxxxxxxxxxxxxxxx) {}' },
+      { role: 'tool', tool_call_id: 'call_xxxxxxxxxxxxxxxxxxxxxxxx', content: 'result' },
+    ];
+    const out = stripFakeToolCallText(messages);
+    assert.deepEqual(out, messages);
+  });
+
+  test('handles array-content assistant messages by leaving them alone', () => {
+    // Array content (multimodal) isn't the observed pollution shape — keep
+    // the function focused; future work can extend to array text parts if
+    // the failure mode shows up there too.
+    const messages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Completed tool calls:\n- foo (call_abc) {}' }],
+      },
+    ];
+    const out = stripFakeToolCallText(messages);
+    assert.deepEqual(out, messages);
+  });
+
+  test('strips multiple bullets in a single block', () => {
+    // The Copilot client sometimes flushes several executed calls together.
+    const content =
+      'doing stuff\n\nCompleted tool calls:\n- read_file (call_aaaaaaaaaaaaaaaaaaaaaaaa) {"path":"/a"}\n- read_file (call_bbbbbbbbbbbbbbbbbbbbbbbb) {"path":"/b"}\n- grep_search (call_cccccccccccccccccccccccc) {"q":"foo"}\n';
+    const out = stripFakeToolCallText([{ role: 'assistant', content }]);
+    const cleaned = (out[0] as { content: string }).content;
+    assert.ok(!/call_/.test(cleaned));
+    assert.equal(cleaned.trim(), 'doing stuff');
+  });
+
+  test('logs a single summary line when blocks are stripped', () => {
+    const logs: string[] = [];
+    stripFakeToolCallText(
+      [
+        {
+          role: 'assistant',
+          content: 'x\n\nCompleted tool calls:\n- a (call_xxxxxxxxxxxxxxxxxxxxxxxx) {}\n',
+        },
+        {
+          role: 'assistant',
+          content: 'y\n\nCompleted tool calls:\n- b (call_yyyyyyyyyyyyyyyyyyyyyyyy) {}\n',
+        },
+      ],
+      (m) => logs.push(m)
+    );
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /Stripped "Completed tool calls" text from 2 assistant message/);
+  });
+});
+
+describe('containsFakeToolCallText', () => {
+  test('returns true for text containing a Completed tool calls block', () => {
+    const text =
+      'doing stuff\n\nCompleted tool calls:\n- read_file (call_91e3b9d70b8c4be0a4d3c1f7) {"endLine":205}\n';
+    assert.equal(containsFakeToolCallText(text), true);
+  });
+
+  test('returns false for normal text without the marker', () => {
+    assert.equal(containsFakeToolCallText('just some analysis text'), false);
+  });
+
+  test('returns false for text mentioning tool calls without the exact format', () => {
+    assert.equal(containsFakeToolCallText('I will call read_file next'), false);
+  });
+
+  test('returns true for multi-bullet blocks', () => {
+    const text =
+      'ok\n\nCompleted tool calls:\n- a (call_aaaaaaaaaaaaaaaaaaaaaaaa) {}\n- b (call_bbbbbbbbbbbbbbbbbbbbbbbb) {}\n';
+    assert.equal(containsFakeToolCallText(text), true);
+  });
+
+  test('can be called multiple times without sticky regex state', () => {
+    const text =
+      'x\n\nCompleted tool calls:\n- a (call_aaaaaaaaaaaaaaaaaaaaaaaa) {}\n';
+    // Call 3 times to test regex lastIndex reset
+    assert.equal(containsFakeToolCallText(text), true);
+    assert.equal(containsFakeToolCallText(text), true);
+    assert.equal(containsFakeToolCallText(text), true);
   });
 });

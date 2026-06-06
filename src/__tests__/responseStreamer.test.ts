@@ -357,3 +357,64 @@ describe('isEmptyStreamResult', () => {
     );
   });
 });
+
+describe('streamResponse captureContent', () => {
+  test('does not capture content by default', async () => {
+    const { reporter } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([{ content: 'hello world' }]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+    });
+    assert.equal(stats.capturedContent, undefined);
+  });
+
+  test('captures content when captureContent is true', async () => {
+    const { reporter } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([
+        { content: 'doing stuff\n\nCompleted tool calls:\n' },
+        { content: '- read_file (call_abc123def456789012345678) {"path":"/x"}\n' },
+      ]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+      captureContent: true,
+    });
+    assert.ok(stats.capturedContent);
+    assert.ok(stats.capturedContent.includes('Completed tool calls'));
+    assert.ok(stats.capturedContent.includes('call_abc123def456789012345678'));
+  });
+
+  test('caps captured content at 20KB', async () => {
+    const { reporter } = makeReporter();
+    const bigChunk = 'x'.repeat(25_000);
+    const stats = await streamResponse({
+      chunks: iter([{ content: bigChunk }]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+      captureContent: true,
+    });
+    assert.ok(stats.capturedContent);
+    assert.equal(stats.capturedContent.length, 20_000);
+  });
+
+  test('does not capture reasoning_content, only visible content', async () => {
+    const { reporter } = makeReporter();
+    const stats = await streamResponse({
+      chunks: iter([
+        { reasoning_content: 'thinking about it...' },
+        { content: 'visible text' },
+      ]),
+      reporter,
+      isCancelled: () => false,
+      resolveToolCallArgs: identityArgs,
+      captureContent: true,
+    });
+    assert.ok(stats.capturedContent);
+    assert.ok(!stats.capturedContent.includes('thinking about it'));
+    assert.ok(stats.capturedContent.includes('visible text'));
+  });
+});
