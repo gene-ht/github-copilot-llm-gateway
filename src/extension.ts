@@ -486,6 +486,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         apiKey: provider.getResolvedApiKey(),
         customHeaders: provider.getCustomHeadersSnapshot(),
         requestTimeout: cfg.get<number>('requestTimeout', 60000),
+        // When false, [CopilotProxy] only logs errors + lifecycle events.
+        // Per-request flow (← method url, Proxy: x → y, pass-through) stays
+        // quiet to keep the output channel readable in normal use.
+        verboseLogging: cfg.get<boolean>('verboseLogging', false),
       },
       proxy: {
         enabled: cfg.get<boolean>('copilotProxy.enabled', false),

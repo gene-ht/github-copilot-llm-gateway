@@ -26,6 +26,12 @@ export interface ProxyUpstreamConfig {
   apiKey?: string;
   customHeaders?: Record<string, string>;
   requestTimeout: number;
+  /**
+   * When true, per-request flow logs (`← method url`, `Proxy: x → y`,
+   * `pass-through to`, etc.) are emitted. Errors and lifecycle events
+   * always log regardless of this flag.
+   */
+  verboseLogging?: boolean;
 }
 
 /** Copilot proxy–specific settings. */
@@ -125,6 +131,17 @@ export class CopilotProxyServer {
     this.log = logger ?? (() => { /* no-op */ });
   }
 
+  /**
+   * Verbose log — per-request flow info that's only emitted when the user has
+   * `verboseLogging` enabled. Use for routine traffic info; errors and
+   * lifecycle events should use the regular `log` so they always show up.
+   */
+  private logVerbose(message: string): void {
+    if (this.upstreamConfig.verboseLogging) {
+      this.log(message);
+    }
+  }
+
   get port(): number | undefined { return this._port; }
   get isRunning(): boolean { return this.server?.listening === true; }
 
@@ -180,7 +197,7 @@ export class CopilotProxyServer {
 
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = req.url ?? '';
-    this.log(`← ${req.method} ${url}`);
+    this.logVerbose(`← ${req.method} ${url}`);
 
     // CORS preflight
     if (req.method === 'OPTIONS') {
@@ -238,7 +255,7 @@ export class CopilotProxyServer {
     // Map model name
     const requestedModel = typeof body.model === 'string' ? body.model : '';
     const model = mapModel(requestedModel, this.proxyConfig.modelMapping, this.fallbackModel);
-    this.log(`Proxy: ${requestedModel} → ${model}`);
+    this.logVerbose(`Proxy: ${requestedModel} → ${model}`);
 
     // Build upstream request
     const upstreamUrl = `${normalizeBaseUrl(this.upstreamConfig.serverUrl)}/v1/chat/completions`;
@@ -332,7 +349,7 @@ export class CopilotProxyServer {
     // Map model name (same logic as /chat/completions)
     const requestedModel = typeof body.model === 'string' ? body.model : '';
     const model = mapModel(requestedModel, this.proxyConfig.modelMapping, this.fallbackModel);
-    this.log(`Anthropic: ${requestedModel} → ${model}`);
+    this.logVerbose(`Anthropic: ${requestedModel} → ${model}`);
 
     // Build upstream request to /v1/messages
     const upstreamUrl = `${normalizeBaseUrl(this.upstreamConfig.serverUrl)}/v1/messages`;
@@ -478,7 +495,7 @@ export class CopilotProxyServer {
     res: http.ServerResponse
   ): Promise<void> {
     const targetUrl = `${CopilotProxyServer.COPILOT_API_HOST}${req.url ?? '/'}`;
-    this.log(`  → pass-through to ${targetUrl}`);
+    this.logVerbose(`  → pass-through to ${targetUrl}`);
 
     // Collect original headers. Replace `host` with the real target so
     // HMAC signature verification against the Host header can pass.
