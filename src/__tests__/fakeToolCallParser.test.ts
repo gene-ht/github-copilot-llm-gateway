@@ -1,6 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFakeToolCalls } from '../fakeToolCallParser';
+import {
+  parseFakeToolCalls,
+  parseAnthropicXmlToolCalls,
+  containsAnthropicXmlToolCall,
+} from '../fakeToolCallParser';
 
 describe('parseFakeToolCalls', () => {
   test('returns empty array for text with no block', () => {
@@ -144,5 +148,140 @@ describe('parseFakeToolCalls', () => {
     const out = parseFakeToolCalls(text);
     assert.equal(out.length, 1);
     assert.equal(out[0].name, 'read_file');
+  });
+});
+
+describe('containsAnthropicXmlToolCall', () => {
+  test('returns false for plain text', () => {
+    assert.equal(containsAnthropicXmlToolCall('just normal text'), false);
+  });
+
+  test('returns true when text contains an <invoke> tag', () => {
+    assert.equal(
+      containsAnthropicXmlToolCall('<invoke name="read_file"></invoke>'),
+      true
+    );
+  });
+
+  test('returns true for single-quoted variants', () => {
+    assert.equal(
+      containsAnthropicXmlToolCall("<invoke name='read_file'></invoke>"),
+      true
+    );
+  });
+});
+
+describe('parseAnthropicXmlToolCalls', () => {
+  test('returns empty array when no <invoke> tag is present', () => {
+    assert.deepEqual(parseAnthropicXmlToolCalls('just normal text'), []);
+  });
+
+  test('parses a single invoke with string parameters', () => {
+    const text =
+      'thinking...\n' +
+      '<invoke name="read_file">\n' +
+      '<parameter name="filePath">/x/y.ts</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].name, 'read_file');
+    assert.match(out[0].id, /^call_xml/);
+    const args = JSON.parse(out[0].arguments);
+    assert.deepEqual(args, { filePath: '/x/y.ts' });
+  });
+
+  test('coerces numeric parameter values to numbers', () => {
+    const text =
+      '<invoke name="read_file">\n' +
+      '<parameter name="startLine">118</parameter>\n' +
+      '<parameter name="endLine">155</parameter>\n' +
+      '<parameter name="filePath">/path/to/file.ts</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.equal(out.length, 1);
+    const args = JSON.parse(out[0].arguments);
+    assert.equal(args.startLine, 118);
+    assert.equal(args.endLine, 155);
+    assert.equal(args.filePath, '/path/to/file.ts');
+  });
+
+  test('coerces boolean and null values', () => {
+    const text =
+      '<invoke name="set_flag">\n' +
+      '<parameter name="enabled">true</parameter>\n' +
+      '<parameter name="disabled">false</parameter>\n' +
+      '<parameter name="optional">null</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    const args = JSON.parse(out[0].arguments);
+    assert.strictEqual(args.enabled, true);
+    assert.strictEqual(args.disabled, false);
+    assert.strictEqual(args.optional, null);
+  });
+
+  test('parses JSON object parameter values', () => {
+    const text =
+      '<invoke name="run_shell">\n' +
+      '<parameter name="opts">{"cwd":"/tmp","env":{"X":"1"}}</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    const args = JSON.parse(out[0].arguments);
+    assert.deepEqual(args.opts, { cwd: '/tmp', env: { X: '1' } });
+  });
+
+  test('parses multiple invokes in one text', () => {
+    const text =
+      'call\n' +
+      '<invoke name="read_file">\n' +
+      '<parameter name="filePath">/a.ts</parameter>\n' +
+      '</invoke>\n' +
+      '<invoke name="read_file">\n' +
+      '<parameter name="filePath">/b.ts</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].name, 'read_file');
+    assert.equal(out[1].name, 'read_file');
+    assert.equal(JSON.parse(out[0].arguments).filePath, '/a.ts');
+    assert.equal(JSON.parse(out[1].arguments).filePath, '/b.ts');
+  });
+
+  test('skips unterminated <invoke> blocks (missing </invoke>)', () => {
+    const text = '<invoke name="read_file"><parameter name="x">1</parameter>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.deepEqual(out, []);
+  });
+
+  test('returns invoke with no parameters as empty args object', () => {
+    const text = '<invoke name="list_files"></invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.equal(out.length, 1);
+    assert.deepEqual(JSON.parse(out[0].arguments), {});
+  });
+
+  test('handles real-world example from user report', () => {
+    const text =
+      'analysis text here\n\n' +
+      'call\n' +
+      '<invoke name="read_file">\n' +
+      '<parameter name="endLine">155</parameter>\n' +
+      '<parameter name="filePath">/Users/gege/workbench/cooperating/projects/photosyn/apps/web/features/ai-support/engine/orchestrator/stages/apply-post-pipeline.ts</parameter>\n' +
+      '<parameter name="startLine">118</parameter>\n' +
+      '</invoke>\n' +
+      '<invoke name="read_file">\n' +
+      '<parameter name="endLine">100</parameter>\n' +
+      '<parameter name="filePath">/Users/gege/workbench/cooperating/projects/photosyn/apps/web/features/ai-support/engine/orchestrator/stages/run-layer3-stage.ts</parameter>\n' +
+      '<parameter name="startLine">40</parameter>\n' +
+      '</invoke>';
+    const out = parseAnthropicXmlToolCalls(text);
+    assert.equal(out.length, 2);
+    const args0 = JSON.parse(out[0].arguments);
+    assert.equal(args0.startLine, 118);
+    assert.equal(args0.endLine, 155);
+    assert.match(args0.filePath, /apply-post-pipeline\.ts$/);
+    const args1 = JSON.parse(out[1].arguments);
+    assert.equal(args1.startLine, 40);
+    assert.equal(args1.endLine, 100);
+    assert.match(args1.filePath, /run-layer3-stage\.ts$/);
   });
 });

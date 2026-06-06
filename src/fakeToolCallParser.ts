@@ -131,3 +131,138 @@ export function parseFakeToolCalls(text: string): ParsedFakeToolCall[] {
 
   return results;
 }
+
+// ---------- Anthropic-style <invoke> / <parameter> format ----------
+
+/**
+ * Regex that locates the start of an `<invoke name="...">` element.
+ *
+ * Some models (notably Claude under long contexts) degrade and write tool
+ * calls using Anthropic's XML invocation syntax — even when the upstream
+ * server doesn't actually support this format. Example seen in the wild:
+ *
+ *     <invoke name="read_file">
+ *     <parameter name="endLine">155</parameter>
+ *     <parameter name="filePath">/path/to/file.ts</parameter>
+ *     <parameter name="startLine">118</parameter>
+ *     </invoke>
+ *
+ * This module parses those blocks back into structured tool calls so the
+ * caller can re-emit them as real `tool_calls` and the user's chat client
+ * can actually execute them.
+ */
+const INVOKE_OPEN_RE = /<invoke\s+name=["']([^"']+)["']\s*>/g;
+
+/**
+ * Regex matching a single `<parameter name="...">value</parameter>` element.
+ * Non-greedy on the value so multiple parameters within one invoke parse
+ * independently. The value can be a primitive (string/number/bool) or a
+ * JSON object/array; we capture it raw and let the caller decide how to
+ * coerce it.\n */
+const PARAM_RE =
+  /<parameter\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/parameter>/g;
+
+/**
+ * Returns true when the given text contains at least one `<invoke name="..."`
+ * tag — fast check before running the full parser.
+ */
+export function containsAnthropicXmlToolCall(text: string): boolean {
+  INVOKE_OPEN_RE.lastIndex = 0;
+  const found = INVOKE_OPEN_RE.test(text);
+  INVOKE_OPEN_RE.lastIndex = 0;
+  return found;
+}
+
+/**
+ * Coerce a raw parameter value to a JSON-serializable primitive.
+ *
+ * Tries (in order):
+ *   1. Empty string → empty string
+ *   2. `true` / `false` / `null` → booleans / null\n *   3. Pure-numeric string → number\n *   4. Looks like JSON object/array → JSON.parse\n *   5. Otherwise → raw trimmed string\n */
+function coerceParameterValue(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === '') { return ''; }
+  if (trimmed === 'true') { return true; }
+  if (trimmed === 'false') { return false; }
+  if (trimmed === 'null') { return null; }
+
+  // Pure numeric: 123, 12.5, -3, 1e5
+  if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (Number.isFinite(n)) { return n; }
+  }
+
+  // JSON object / array — attempt parse, fall back to string on failure
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      /* fall through to string */
+    }
+  }
+
+  return trimmed;
+}
+
+/**
+ * Generate a synthetic tool-call id for an invoke block that doesn't carry
+ * one. Format mirrors OpenAI's `call_<hex>` convention so downstream code
+ * doesn't need to special-case the rescue path.
+ */
+function synthesizeCallId(): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  const ts = Date.now().toString(36);
+  return `call_xml${ts}${rand}`;
+}
+
+/**
+ * Parse all `<invoke name="...">...</invoke>` blocks from a text and return
+ * the structured tool calls found inside them.
+ *
+ * - Multiple `<invoke>` blocks are aggregated in source order.
+ * - Each `<parameter>` becomes a key in the arguments JSON object.
+ * - Unterminated `<invoke>` blocks (missing `</invoke>`) are skipped.
+ * - Parameter values are coerced via {@link coerceParameterValue}.
+ * - Returns `[]` when no recognizable block is found.
+ */
+export function parseAnthropicXmlToolCalls(text: string): ParsedFakeToolCall[] {
+  const results: ParsedFakeToolCall[] = [];
+
+  INVOKE_OPEN_RE.lastIndex = 0;
+  let openMatch: RegExpExecArray | null;
+  while ((openMatch = INVOKE_OPEN_RE.exec(text)) !== null) {
+    const name = openMatch[1];
+    const blockStart = openMatch.index + openMatch[0].length;
+
+    // Find matching </invoke>
+    const closeIdx = text.indexOf('</invoke>', blockStart);
+    if (closeIdx < 0) { break; }
+
+    const body = text.slice(blockStart, closeIdx);
+
+    // Extract parameters
+    const args: Record<string, unknown> = {};
+    PARAM_RE.lastIndex = 0;
+    let paramMatch: RegExpExecArray | null;
+    while ((paramMatch = PARAM_RE.exec(body)) !== null) {
+      const paramName = paramMatch[1];
+      const paramRaw = paramMatch[2];
+      args[paramName] = coerceParameterValue(paramRaw);
+    }
+
+    results.push({
+      id: synthesizeCallId(),
+      name,
+      arguments: JSON.stringify(args),
+    });
+
+    // Advance regex cursor past </invoke> for the next iteration
+    INVOKE_OPEN_RE.lastIndex = closeIdx + '</invoke>'.length;
+  }
+
+  INVOKE_OPEN_RE.lastIndex = 0;
+  return results;
+}

@@ -200,16 +200,40 @@ const FAKE_TOOL_CALL_TEXT_RE =
   /\n*Completed tool calls:\s*\n(?:[ \t]*-[ \t]+\S+[ \t]*\(call_[0-9a-zA-Z]+\)[ \t]*\{[\s\S]*?\}[ \t]*\n?)+/g;
 
 /**
- * Returns true when the given text contains a "Completed tool calls" block
- * in the format Copilot Chat's history serializer uses. Useful for detecting
- * self-poisoning in streaming output *before* the text is fed back into
- * history.
+ * Regex that matches Anthropic-style `<invoke name="...">...</invoke>` blocks
+ * — the second known fake-toolcall self-poisoning format. Example:
+ *
+ *     <invoke name="read_file">
+ *     <parameter name="endLine">155</parameter>
+ *     <parameter name="filePath">/path/to/file.ts</parameter>
+ *     </invoke>
+ *
+ * Same self-poisoning concern as the "Completed tool calls:" format — once
+ * an assistant message contains this text, future turns will mimic it.
+ *
+ * Also matches an optional leading `call` keyword and trailing whitespace so
+ * the surrounding "call\n<invoke>...</invoke>" preamble seen in real
+ * captures gets cleaned up.
+ */
+const ANTHROPIC_XML_TOOL_CALL_RE =
+  /(?:^|\n)[ \t]*(?:call[ \t]*\n[ \t]*)?<invoke\s+name=["'][^"']+["']\s*>[\s\S]*?<\/invoke>[ \t]*\n?/g;
+
+/**
+ * Returns true when the given text contains either known fake-toolcall
+ * format (Copilot's "Completed tool calls:" block or Anthropic-style
+ * `<invoke>` XML). Useful for detecting self-poisoning in streaming output
+ * *before* the text is fed back into history.
  */
 export function containsFakeToolCallText(text: string): boolean {
   FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
-  const result = FAKE_TOOL_CALL_TEXT_RE.test(text);
-  FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
-  return result;
+  if (FAKE_TOOL_CALL_TEXT_RE.test(text)) {
+    FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+    return true;
+  }
+  ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+  const xmlMatch = ANTHROPIC_XML_TOOL_CALL_RE.test(text);
+  ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+  return xmlMatch;
 }
 
 /**
@@ -234,7 +258,8 @@ export function stripFakeToolCallText(
   messages: readonly OpenAIMessage[],
   log: ConverterLogger = NOOP_LOGGER
 ): OpenAIMessage[] {
-  let strippedCount = 0;
+  let strippedBulletCount = 0;
+  let strippedXmlCount = 0;
   const result: OpenAIMessage[] = [];
 
   for (const msg of messages) {
@@ -247,14 +272,27 @@ export function stripFakeToolCallText(
     }
 
     FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
-    if (!FAKE_TOOL_CALL_TEXT_RE.test(content)) {
+    ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+    const hasBullet = FAKE_TOOL_CALL_TEXT_RE.test(content);
+    const hasXml = ANTHROPIC_XML_TOOL_CALL_RE.test(content);
+
+    if (!hasBullet && !hasXml) {
       result.push(msg);
       continue;
     }
 
     FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
-    const cleaned = content.replace(FAKE_TOOL_CALL_TEXT_RE, '\n').trim();
-    strippedCount++;
+    ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+    let cleaned = content;
+    if (hasBullet) {
+      cleaned = cleaned.replace(FAKE_TOOL_CALL_TEXT_RE, '\n');
+      strippedBulletCount++;
+    }
+    if (hasXml) {
+      cleaned = cleaned.replace(ANTHROPIC_XML_TOOL_CALL_RE, '\n');
+      strippedXmlCount++;
+    }
+    cleaned = cleaned.trim();
 
     // If the assistant message had a real tool_calls field, keep it even
     // when the human-readable part became empty — the structured call is
@@ -267,8 +305,11 @@ export function stripFakeToolCallText(
     }
   }
 
-  if (strippedCount > 0) {
-    log(`Stripped "Completed tool calls" text from ${strippedCount} assistant message(s)`);
+  if (strippedBulletCount > 0) {
+    log(`Stripped "Completed tool calls" text from ${strippedBulletCount} assistant message(s)`);
+  }
+  if (strippedXmlCount > 0) {
+    log(`Stripped Anthropic <invoke> XML from ${strippedXmlCount} assistant message(s)`);
   }
   return result;
 }

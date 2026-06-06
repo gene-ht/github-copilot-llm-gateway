@@ -9,7 +9,11 @@ import {
   stripFakeToolCallText,
   containsFakeToolCallText,
 } from './messageConverter';
-import { parseFakeToolCalls } from './fakeToolCallParser';
+import {
+  parseFakeToolCalls,
+  parseAnthropicXmlToolCalls,
+  containsAnthropicXmlToolCall,
+} from './fakeToolCallParser';
 import {
   TOKEN_CONSTANTS,
   buildInputText,
@@ -806,11 +810,20 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         hasTools &&
         stats.totalToolCalls === 0 &&
         stats.capturedContent &&
-        containsFakeToolCallText(stats.capturedContent) &&
+        (
+          containsFakeToolCallText(stats.capturedContent) ||
+          containsAnthropicXmlToolCall(stats.capturedContent)
+        ) &&
         !token.isCancellationRequested
       ) {
         // -------- Step 1: try to reconstruct tool_calls from text --------
-        const parsed = parseFakeToolCalls(stats.capturedContent);
+        // Try both known fake-tool-call formats:
+        //   1. Copilot's "Completed tool calls:" markdown bullet format
+        //   2. Anthropic's `<invoke name="..."><parameter ...></invoke>` XML
+        const parsed = [
+          ...parseFakeToolCalls(stats.capturedContent),
+          ...parseAnthropicXmlToolCalls(stats.capturedContent),
+        ];
         if (parsed.length > 0) {
           this.outputChannel.appendLine(
             `WARNING: Model wrote tool calls as plain text. ` +
@@ -1321,6 +1334,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   ): void {
     const markers: Array<{ name: string; regex: RegExp; count: number; firstHit?: { msgIndex: number; snippet: string } }> = [
       { name: 'Completed tool calls (fake-toolcall self-poisoning)', regex: /Completed tool calls:\s*\n[ \t]*-[ \t]+\S+[ \t]*\(call_[0-9a-zA-Z]+\)/g, count: 0 },
+      { name: 'Anthropic <invoke> XML (fake-toolcall self-poisoning)', regex: /<invoke\s+name=["'][^"']+["']\s*>/g, count: 0 },
     ];
 
     for (let i = 0; i < openAIMessages.length; i++) {
