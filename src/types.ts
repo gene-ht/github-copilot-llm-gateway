@@ -141,4 +141,15 @@ export interface GatewayConfig {
    * Can be overridden per model via `perModelSettings.<id>.transport`.
    */
   useAnthropicNative: boolean;
+  /**
+   * When true, bypass all OpenAI / Anthropic format conversion and send
+   * `LanguageModelChatMessage[]` directly to the upstream Gateway via
+   * `POST /lm/chat`. The upstream is responsible for all model-specific
+   * format translation. Responses come back as a simple SSE stream with
+   * typed events (`text`, `tool_call`, `thinking`, `done`, `error`).
+   *
+   * Can be overridden per model via `perModelSettings.<id>.transport`
+   * set to `'lm-passthrough'`.
+   */
+  useLmPassthrough: boolean;
 }

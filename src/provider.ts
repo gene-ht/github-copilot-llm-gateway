@@ -34,6 +34,7 @@ import {
   streamResponse,
 } from './responseStreamer';
 import { dedupeModels, friendlyModelName } from './modelDisplay';
+import { streamLmPassthrough } from './lm-passthrough';
 import {
   isClaudeModel,
   convertMessagesToAnthropic,
@@ -599,8 +600,22 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const modelName = friendlyModelName(model.id);
     this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
 
-    // ── Transport detection: Anthropic or OpenAI? ───────────────────────
+    // ── Transport detection: LM Passthrough, Anthropic, or OpenAI? ──────
     const perModelTransport = this.config.perModelSettings[model.id]?.transport;
+
+    const useLmPassthroughTransport =
+      perModelTransport === 'lm-passthrough' ||
+      (perModelTransport !== 'openai' &&
+       perModelTransport !== 'anthropic' &&
+       this.config.useLmPassthrough);
+
+    if (useLmPassthroughTransport) {
+      this.outputChannel.appendLine(
+        `[transport=lm-passthrough] Using LM passthrough for ${model.id}`
+      );
+      return this.handleLmPassthroughRequest(model, messages, options, progress, token, modelName);
+    }
+
     const useAnthropicTransport =
       perModelTransport === 'anthropic' ||
       (perModelTransport !== 'openai' &&
@@ -958,6 +973,80 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
   }
 
   // =====================================================================
+  // LM Passthrough path
+  // =====================================================================
+
+  /**
+   * Handle a request using the LM passthrough protocol (`POST /lm/chat`).
+   *
+   * This bypasses all OpenAI / Anthropic format conversion and sends
+   * `LanguageModelChatMessage[]` directly to the upstream Gateway. The
+   * upstream is responsible for all model-specific format translation.
+   *
+   * Skips everything the OpenAI and Anthropic paths do:
+   *   - No message conversion (OpenAI or Anthropic)
+   *   - No token budget calculation / truncation
+   *   - No tool pairing repair
+   *   - No fake tool-call detection / retry
+   *   - No thinking tag parsing
+   *
+   * Reuses:
+   *   - `recordCompletedRequest` for session stats
+   *   - `_onDidChangeRequestState` for status bar
+   */
+  private async handleLmPassthroughRequest(
+    model: vscode.LanguageModelChatInformation,
+    messages: readonly vscode.LanguageModelChatMessage[],
+    options: vscode.ProvideLanguageModelChatResponseOptions,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    token: vscode.CancellationToken,
+    modelName: string
+  ): Promise<void> {
+    try {
+      this.outputChannel.appendLine(
+        `[lm-passthrough] model=${model.id} ` +
+        `messages=${messages.length} tools=${options.tools?.length ?? 0}`
+      );
+
+      const stats = await streamLmPassthrough({
+        serverUrl: this.config.serverUrl,
+        apiKey: this.config.apiKey,
+        customHeaders: this.config.customHeaders,
+        requestTimeout: this.config.requestTimeout,
+        model: model.id,
+        messages,
+        tools: options.tools,
+        progress,
+        token,
+        log: (msg) => this.outputChannel.appendLine(msg),
+        verbose: this.config.verboseLogging,
+      });
+
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[lm-passthrough] Completed: ${stats.totalTextParts} text, ` +
+          `${stats.totalToolCalls} tool calls, ${stats.totalThinkingParts} thinking`
+        );
+      }
+
+      this.recordCompletedRequest(model.id, modelName, undefined);
+      this._onDidChangeRequestState.fire({
+        kind: 'complete',
+        modelId: model.id,
+        modelName,
+      });
+    } catch (error) {
+      this._onDidChangeRequestState.fire({
+        kind: 'error',
+        modelId: model.id,
+        modelName,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      this.handleChatError(error);
+    }
+  }
+
+  // =====================================================================
   // Anthropic Messages API path
   // =====================================================================
 
@@ -995,12 +1084,27 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       // 1. Convert messages to Anthropic format
       const conversion = convertMessagesToAnthropic(messages, this.config.enableImageInput);
 
-      if (this.config.verboseLogging) {
-        this.outputChannel.appendLine(
-          `[Anthropic] Converted ${messages.length} VS Code messages → ` +
-          `${conversion.messages.length} Anthropic messages` +
-          (conversion.system.text ? ` + system (${conversion.system.text.length} chars)` : '')
-        );
+      // Always log conversion summary + validate first message for orphaned tool_result
+      this.outputChannel.appendLine(
+        `[Anthropic] Converted ${messages.length} VS Code messages → ` +
+        `${conversion.messages.length} Anthropic messages` +
+        (conversion.system.text ? ` + system (${conversion.system.text.length} chars)` : '')
+      );
+
+      // Diagnostic: check if msg[0] has orphaned tool_result
+      if (conversion.messages.length > 0) {
+        const first = conversion.messages[0];
+        if (Array.isArray(first.content)) {
+          const orphans = (first.content as unknown as Array<Record<string, unknown>>).filter(
+            b => b.type === 'tool_result'
+          );
+          if (orphans.length > 0) {
+            this.outputChannel.appendLine(
+              `[Anthropic] WARNING: msg[0] has ${orphans.length} tool_result blocks after strip! ` +
+              `IDs: ${orphans.map(b => b.tool_use_id).join(', ')}`
+            );
+          }
+        }
       }
 
       // 2. Convert tools
@@ -1805,6 +1909,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       stripFakeToolCallText: config.get<boolean>('stripFakeToolCallText', true),
       retryFakeToolCalls: config.get<boolean>('retryFakeToolCalls', true),
       useAnthropicNative: config.get<boolean>('useAnthropicNative', true),
+      useLmPassthrough: config.get<boolean>('useLmPassthrough', false),
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)

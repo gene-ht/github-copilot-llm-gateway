@@ -117,7 +117,63 @@ export function convertMessagesToAnthropic(
     }
   }
 
-  return { messages: mergedMessages, system: systemMessage };
+  // Anthropic API strictly validates tool_use/tool_result pairing: every
+  // tool_result must have a matching tool_use in the immediately preceding
+  // assistant message. VS Code can truncate conversation history mid-turn,
+  // leaving orphaned tool_result blocks at the start. Strip them.
+  const validatedMessages = stripOrphanedToolResults(mergedMessages);
+
+  return { messages: validatedMessages, system: systemMessage };
+}
+
+/**
+ * Remove `tool_result` content blocks whose `tool_use_id` has no matching
+ * `tool_use` block in the immediately preceding `assistant` message.
+ *
+ * This handles the case where VS Code truncates conversation history and
+ * resumes mid-tool-call-sequence, leaving the first user message with
+ * tool_result blocks whose tool_use was in a truncated assistant message.
+ */
+function stripOrphanedToolResults(messages: MessageParam[]): MessageParam[] {
+  const result: MessageParam[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      // Collect tool_use IDs from the preceding assistant message
+      const prev = result.length > 0 ? result[result.length - 1] : undefined;
+      const validIds = new Set<string>();
+      if (prev?.role === 'assistant' && Array.isArray(prev.content)) {
+        for (const block of prev.content) {
+          const b = block as unknown as Record<string, unknown>;
+          if (b.type === 'tool_use' && typeof b.id === 'string') {
+            validIds.add(b.id);
+          }
+        }
+      }
+
+      // Keep non-tool_result blocks + tool_result blocks with valid IDs
+      const filtered = (msg.content as ContentBlockParam[]).filter((block) => {
+        const b = block as unknown as Record<string, unknown>;
+        if (b.type === 'tool_result') {
+          return validIds.has(b.tool_use_id as string);
+        }
+        return true;
+      });
+
+      if (filtered.length > 0) {
+        result.push({ role: 'user', content: filtered });
+      }
+    } else {
+      result.push(msg);
+    }
+  }
+
+  // Ensure conversation starts with user message
+  while (result.length > 0 && result[0].role !== 'user') {
+    result.shift();
+  }
+
+  return result;
 }
 
 function convertContentParts(

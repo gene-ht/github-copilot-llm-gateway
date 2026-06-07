@@ -2,7 +2,7 @@
   "name": "github-copilot-llm-gateway-v2",
   "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -196,6 +196,12 @@
           "description": "When enabled, route requests for Claude models to the upstream's /v1/messages (Anthropic Messages API) instead of /v1/chat/completions (OpenAI format). This eliminates lossy format translation and resolves tool-call self-poisoning. Disable to force all models through the OpenAI-compatible endpoint. Can also be overridden per model via perModelSettings.<id>.transport ('openai' or 'anthropic').",
           "order": 13
         },
+        "github.copilot.llm-gateway.useLmPassthrough": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When enabled, **all** requests bypass OpenAI/Anthropic format conversion and send `LanguageModelChatMessage[]` directly to the upstream Gateway via `POST /lm/chat`. The upstream is responsible for all model-specific format translation (OpenAI, Anthropic, etc.). Responses come back as a simple SSE stream.\n\nThis takes precedence over `useAnthropicNative` — when enabled, every model goes through the passthrough path regardless of whether it's Claude, GPT, or any other model.\n\nTo selectively override a single model back to OpenAI or Anthropic, set `perModelSettings.<id>.transport` to `'openai'` or `'anthropic'`.",
+          "order": 14
+        },
         "github.copilot.llm-gateway.customHeaders": {
           "type": "object",
           "default": {},
@@ -220,7 +226,7 @@
             "type": "object",
             "additionalProperties": true
           },
-          "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"reasoning_effort\": \"high\" },\n  \"gpt-5.5\": { \"reasoning_effort\": \"medium\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"max_tokens\": 8192 }\n}\n```",
+          "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nUse `transport` to select the request path per model: `'openai'` (default), `'anthropic'`, or `'lm-passthrough'`.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"transport\": \"anthropic\", \"reasoning_effort\": \"high\" },\n  \"gpt-5.5\": { \"reasoning_effort\": \"medium\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"transport\": \"lm-passthrough\" }\n}\n```",
           "order": 13
         },
         "github.copilot.llm-gateway.copilotProxy.enabled": {

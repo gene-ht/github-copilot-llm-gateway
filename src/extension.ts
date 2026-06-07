@@ -893,7 +893,7 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
 // ---------- Copilot System Config (top-level menu) ----------
 
 interface SystemPickItem extends vscode.QuickPickItem {
-  action: 'toggleMemoryWrite' | 'toggleMemoryRead' | 'toggleAnthropicNative' | 'done';
+  action: 'toggleMemoryWrite' | 'toggleMemoryRead' | 'toggleLmPassthrough' | 'toggleAnthropicNative' | 'done';
 }
 
 /**
@@ -943,6 +943,19 @@ async function copilotSystemSettingsFlow(): Promise<void> {
       action: 'done',
     });
 
+    const lmPassthrough = readVSCodeBooleanSetting(
+      'github.copilot.llm-gateway.useLmPassthrough',
+      false
+    );
+    items.push({
+      label: lmPassthrough
+        ? '$(check) LM Passthrough: Enabled'
+        : '$(circle-slash) LM Passthrough: Disabled',
+      description: 'github.copilot.llm-gateway.useLmPassthrough',
+      detail: 'Enable → ALL models bypass OpenAI/Anthropic conversion and send messages directly via POST /v1/lm/chat; Disable → use OpenAI or Anthropic transport',
+      action: 'toggleLmPassthrough',
+    });
+
     const anthropicNative = readVSCodeBooleanSetting(
       'github.copilot.llm-gateway.useAnthropicNative',
       true
@@ -952,7 +965,9 @@ async function copilotSystemSettingsFlow(): Promise<void> {
         ? '$(check) Anthropic Native Transport: Enabled'
         : '$(circle-slash) Anthropic Native Transport: Disabled',
       description: 'github.copilot.llm-gateway.useAnthropicNative',
-      detail: 'Enable → Claude models use /v1/messages (native Anthropic API); Disable → all models use /v1/chat/completions (OpenAI format)',
+      detail: lmPassthrough
+        ? '(Overridden by LM Passthrough) Enable → Claude models use /v1/messages; Disable → all use /v1/chat/completions'
+        : 'Enable → Claude models use /v1/messages (native Anthropic API); Disable → all models use /v1/chat/completions (OpenAI format)',
       action: 'toggleAnthropicNative',
     });
 
@@ -988,6 +1003,12 @@ async function copilotSystemSettingsFlow(): Promise<void> {
         'github.copilot.chat.copilotMemory.enabled',
         !readEnabled
       );
+      continue;
+    }
+
+    if (pick.action === 'toggleLmPassthrough') {
+      const cfg = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
+      await cfg.update('useLmPassthrough', !lmPassthrough, vscode.ConfigurationTarget.Global);
       continue;
     }
 
