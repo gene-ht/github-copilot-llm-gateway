@@ -386,9 +386,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         [
           { label: '$(server) Configure Server', description: 'Set server URL and API key', id: 'server' },
           { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
-          { label: '$(globe) Copilot Proxy', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },
+          { label: '$(globe) Proxy Server', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },
           { label: '$(symbol-class) Sub-agent Settings', description: 'Configure Copilot sub-agents to use Gateway models', id: 'subagentSettings' },
-          { label: '$(database) Copilot Memory Settings', description: 'Toggle Copilot Memory write/read (cross-session context)', id: 'copilotMemory' },
+          { label: '$(settings-gear) Copilot System Config', description: 'Memory, Anthropic native transport, and other system toggles', id: 'copilotSystem' },
           { label: '$(edit) Edit Custom Headers', description: 'Manage HTTP headers (stored in secret storage)', id: 'headers' },
           { label: '$(settings-gear) Open Settings', description: 'All LLM Gateway settings', id: 'settings' },
           { label: '$(refresh) Refresh Models', description: 'Re-fetch model list from server', id: 'refresh' },
@@ -410,8 +410,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         case 'subagentSettings':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.subagentSettings');
           break;
-        case 'copilotMemory':
-          await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotMemorySettings');
+        case 'copilotSystem':
+          await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotSystemSettings');
           break;
         case 'headers':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.editCustomHeaders');
@@ -557,7 +557,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.showInformationMessage('LLM Gateway: Copilot proxy stopped');
   };
 
-  // Copilot Proxy Settings command — QuickPick-based interactive flow
+  // Proxy Server command — QuickPick-based interactive flow
   const proxySettingsCommand = vscode.commands.registerCommand(
     'github.copilot.llm-gateway.copilotProxySettings',
     async () => {
@@ -586,15 +586,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   context.subscriptions.push(subagentSettingsCommand);
 
-  // Copilot Memory Settings command — toggle Copilot's Memory feature
-  // (write/read) to control cross-session context transfer.
-  const copilotMemorySettingsCommand = vscode.commands.registerCommand(
-    'github.copilot.llm-gateway.copilotMemorySettings',
+  // Copilot System Config command — memory toggles, Anthropic native
+  // transport, and other system-level Copilot settings.
+  const copilotSystemSettingsCommand = vscode.commands.registerCommand(
+    'github.copilot.llm-gateway.copilotSystemSettings',
     async () => {
-      await copilotMemorySettingsFlow();
+      await copilotSystemSettingsFlow();
     }
   );
-  context.subscriptions.push(copilotMemorySettingsCommand);
+  context.subscriptions.push(copilotSystemSettingsCommand);
 
   // Auto-start if enabled in settings
   const { proxy: initialProxyConfig } = readProxyConfigs();
@@ -890,31 +890,26 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
   }
 }
 
-// ---------- Copilot Memory Settings (top-level menu) ----------
+// ---------- Copilot System Config (top-level menu) ----------
 
-interface MemoryPickItem extends vscode.QuickPickItem {
-  action: 'toggleWrite' | 'toggleRead' | 'done';
+interface SystemPickItem extends vscode.QuickPickItem {
+  action: 'toggleMemoryWrite' | 'toggleMemoryRead' | 'toggleAnthropicNative' | 'done';
 }
 
 /**
- * Copilot Memory Settings — standalone menu for managing Copilot's Memory
- * feature. Memory is the main cross-session context-transfer mechanism in
- * Copilot Chat (the `store_memory` tool persists info between conversations
- * across the user/repo/session layers).
+ * Copilot System Config — standalone menu for system-level Copilot
+ * configuration that affects all sessions.
  *
  * Toggles:
  *   - Write Copilot Memory → github.copilot.chat.tools.memory.enabled
- *     Controls whether the LLM is given the `store_memory` tool.
  *   - Read Copilot Memory  → github.copilot.chat.copilotMemory.enabled
- *     Controls whether stored memories are injected into the chat context.
- *
- * Disable both to fully isolate sessions (no new memories saved, no old
- * memories loaded).
+ *   - Anthropic Native Transport → github.copilot.llm-gateway.useAnthropicNative
  */
-async function copilotMemorySettingsFlow(): Promise<void> {
+async function copilotSystemSettingsFlow(): Promise<void> {
   while (true) {
-    const items: MemoryPickItem[] = [];
+    const items: SystemPickItem[] = [];
 
+    // ── Memory section ──
     const writeEnabled = readVSCodeBooleanSetting(
       'github.copilot.chat.tools.memory.enabled',
       true
@@ -925,7 +920,7 @@ async function copilotMemorySettingsFlow(): Promise<void> {
         : '$(circle-slash) Write Copilot Memory: Disabled',
       description: 'github.copilot.chat.tools.memory.enabled',
       detail: 'Enable → LLM can save new memories via the store_memory tool; Disable → no new memories saved',
-      action: 'toggleWrite',
+      action: 'toggleMemoryWrite',
     });
 
     const readEnabled = readVSCodeBooleanSetting(
@@ -938,7 +933,27 @@ async function copilotMemorySettingsFlow(): Promise<void> {
         : '$(circle-slash) Read Copilot Memory: Disabled',
       description: 'github.copilot.chat.copilotMemory.enabled',
       detail: 'Enable → stored memories are injected into chat context; Disable → ignore stored memories',
-      action: 'toggleRead',
+      action: 'toggleMemoryRead',
+    });
+
+    // ── Transport section ──
+    items.push({
+      label: '',
+      kind: vscode.QuickPickItemKind.Separator,
+      action: 'done',
+    });
+
+    const anthropicNative = readVSCodeBooleanSetting(
+      'github.copilot.llm-gateway.useAnthropicNative',
+      true
+    );
+    items.push({
+      label: anthropicNative
+        ? '$(check) Anthropic Native Transport: Enabled'
+        : '$(circle-slash) Anthropic Native Transport: Disabled',
+      description: 'github.copilot.llm-gateway.useAnthropicNative',
+      detail: 'Enable → Claude models use /v1/messages (native Anthropic API); Disable → all models use /v1/chat/completions (OpenAI format)',
+      action: 'toggleAnthropicNative',
     });
 
     items.push({
@@ -954,13 +969,13 @@ async function copilotMemorySettingsFlow(): Promise<void> {
     });
 
     const pick = await vscode.window.showQuickPick(items, {
-      title: 'LLM Gateway — Copilot Memory Settings',
-      placeHolder: 'Toggle Copilot Memory write/read to control cross-session context transfer',
+      title: 'LLM Gateway — Copilot System Config',
+      placeHolder: 'Memory, transport, and other system-level toggles',
     });
 
     if (!pick || pick.action === 'done') { return; }
 
-    if (pick.action === 'toggleWrite') {
+    if (pick.action === 'toggleMemoryWrite') {
       await writeVSCodeSetting(
         'github.copilot.chat.tools.memory.enabled',
         !writeEnabled
@@ -968,11 +983,17 @@ async function copilotMemorySettingsFlow(): Promise<void> {
       continue;
     }
 
-    if (pick.action === 'toggleRead') {
+    if (pick.action === 'toggleMemoryRead') {
       await writeVSCodeSetting(
         'github.copilot.chat.copilotMemory.enabled',
         !readEnabled
       );
+      continue;
+    }
+
+    if (pick.action === 'toggleAnthropicNative') {
+      const cfg = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
+      await cfg.update('useAnthropicNative', !anthropicNative, vscode.ConfigurationTarget.Global);
       continue;
     }
   }

@@ -34,6 +34,15 @@ import {
   streamResponse,
 } from './responseStreamer';
 import { dedupeModels, friendlyModelName } from './modelDisplay';
+import {
+  isClaudeModel,
+  convertMessagesToAnthropic,
+  convertToolsToAnthropic,
+  mapToolChoice as mapAnthropicToolChoice,
+  buildAnthropicRequest,
+  createAnthropicClient,
+  streamAnthropicResponse,
+} from './gateway-anthropic-provider';
 import { buildModelInfo } from './modelInfoBuilder';
 import { TokenUsage, extractHost } from './statusBarController';
 import {
@@ -590,6 +599,22 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     const modelName = friendlyModelName(model.id);
     this._onDidChangeRequestState.fire({ kind: 'start', modelId: model.id, modelName });
 
+    // ── Transport detection: Anthropic or OpenAI? ───────────────────────
+    const perModelTransport = this.config.perModelSettings[model.id]?.transport;
+    const useAnthropicTransport =
+      perModelTransport === 'anthropic' ||
+      (perModelTransport !== 'openai' &&
+       this.config.useAnthropicNative &&
+       isClaudeModel(model.id));
+
+    if (useAnthropicTransport) {
+      this.outputChannel.appendLine(
+        `[transport=anthropic] Using native Anthropic Messages API for ${model.id}`
+      );
+      return this.handleAnthropicRequest(model, messages, options, progress, token, modelName);
+    }
+
+    // ── OpenAI transport (default) ──────────────────────────────────────
     let openAIMessages = this.convertAllMessages(messages);
 
     // Always-on detection: scan for Copilot Chat's cross-session injection
@@ -914,6 +939,213 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         const toolCount = tools?.length ?? 0;
         await this.handleEmptyResponse(model, inputText, openAIMessages.length, toolCount, token, progress);
       }
+      this.recordCompletedRequest(model.id, modelName, capturedUsage);
+      this._onDidChangeRequestState.fire({
+        kind: 'complete',
+        modelId: model.id,
+        modelName,
+        usage: capturedUsage,
+      });
+    } catch (error) {
+      this._onDidChangeRequestState.fire({
+        kind: 'error',
+        modelId: model.id,
+        modelName,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      this.handleChatError(error);
+    }
+  }
+
+  // =====================================================================
+  // Anthropic Messages API path
+  // =====================================================================
+
+  /**
+   * Handle a request using Anthropic's native Messages API (`/v1/messages`).
+   *
+   * This is the counterpart of the OpenAI path in `provideLanguageModelChatResponse`.
+   * It converts messages directly to Anthropic format (no intermediate OpenAI
+   * conversion), sends to `/v1/messages`, and parses Anthropic SSE events.
+   *
+   * Reuses the existing Gateway infrastructure:
+   *   - `createStreamReporter` for progress + usage reporting
+   *   - `calculateSafeMaxOutputTokens` for token budget
+   *   - `resolveToolCallArgs` for JSON repair + schema fill
+   *   - `recordCompletedRequest` for session stats
+   *   - `_onDidChangeRequestState` for status bar
+   *
+   * Skips OpenAI-only workarounds:
+   *   - `stripFakeToolCallText` (not needed — native tool_use blocks)
+   *   - `repairToolCallPairing` (not needed — converter emits paired)
+   *   - `mergeConsecutiveSameRoleMessages` (done by converter inline)
+   *   - Fake-tool-call retry (not needed — self-poisoning resolved)
+   */
+  private async handleAnthropicRequest(
+    model: vscode.LanguageModelChatInformation,
+    messages: readonly vscode.LanguageModelChatMessage[],
+    options: vscode.ProvideLanguageModelChatResponseOptions,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    token: vscode.CancellationToken,
+    modelName: string
+  ): Promise<void> {
+    let capturedUsage: TokenUsage | undefined;
+
+    try {
+      // 1. Convert messages to Anthropic format
+      const conversion = convertMessagesToAnthropic(messages, this.config.enableImageInput);
+
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[Anthropic] Converted ${messages.length} VS Code messages → ` +
+          `${conversion.messages.length} Anthropic messages` +
+          (conversion.system.text ? ` + system (${conversion.system.text.length} chars)` : '')
+        );
+      }
+
+      // 2. Convert tools
+      const anthropicTools = convertToolsToAnthropic(options.tools);
+      const hasTools = anthropicTools !== undefined && anthropicTools.length > 0;
+
+      // 3. Build tool schemas for resolveToolCallArgs (reuses OpenAI path's logic)
+      const { schemas: toolSchemas } = this.buildToolsConfig(options);
+
+      // 4. Calculate safe max output tokens
+      // Estimate input tokens from the Anthropic message content
+      let inputEstimate = estimateTextTokens(conversion.system.text);
+      for (const msg of conversion.messages) {
+        if (typeof msg.content === 'string') {
+          inputEstimate += estimateTextTokens(msg.content);
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (typeof block === 'string') {
+              inputEstimate += estimateTextTokens(block);
+            } else if ('text' in block && typeof (block as unknown as Record<string, unknown>).text === 'string') {
+              inputEstimate += estimateTextTokens((block as unknown as Record<string, unknown>).text as string);
+            } else if ('input' in block) {
+              inputEstimate += estimateTextTokens(JSON.stringify((block as unknown as Record<string, unknown>).input));
+            }
+          }
+        }
+      }
+      const toolsSerializedLength = anthropicTools
+        ? JSON.stringify(anthropicTools).length
+        : 0;
+      const toolsOverhead = Math.ceil(toolsSerializedLength / TOKEN_CONSTANTS.CHARS_PER_TOKEN);
+
+      const modelMaxContext = this.config.defaultMaxTokens;
+      const configuredMaxOutput = this.config.defaultMaxOutputTokens;
+      const safeMaxOutputTokens = calculateSafeMaxOutputTokens({
+        estimatedInputTokens: inputEstimate,
+        toolsOverhead,
+        modelMaxContext,
+        configuredMaxOutput,
+      });
+
+      // 5. Read per-model settings
+      const safeShallowClone = (src: unknown): Record<string, unknown> => {
+        const out: Record<string, unknown> = {};
+        if (!src || typeof src !== 'object') { return out; }
+        try {
+          for (const key of Object.keys(src as Record<string, unknown>)) {
+            try {
+              const value = (src as Record<string, unknown>)[key];
+              if (value !== undefined) { out[key] = value; }
+            } catch { /* skip throwing getters */ }
+          }
+        } catch { /* skip */ }
+        return out;
+      };
+
+      const perModelOverride = safeShallowClone(this.config.perModelSettings[model.id]);
+      const callerOverride = safeShallowClone(options.modelOptions);
+      const extraModelOptions = safeShallowClone(this.config.extraModelOptions);
+      const mergedExtras = { ...extraModelOptions, ...perModelOverride, ...callerOverride };
+
+      const temperature = hasTools ? this.config.agentTemperature : undefined;
+
+      this.outputChannel.appendLine(
+        `[Anthropic] model=${model.id} ` +
+        `safeMaxOutputTokens=${safeMaxOutputTokens} ` +
+        `perModel.keys=[${Object.keys(perModelOverride).join(',') || '(none)'}]`
+      );
+      if (Object.keys(perModelOverride).length > 0) {
+        this.outputChannel.appendLine(
+          `[Anthropic] perModelSettings[${model.id}] = ${JSON.stringify(perModelOverride)}`
+        );
+      }
+
+      // 6. Build request
+      const toolChoice = hasTools
+        ? mapAnthropicToolChoice(options.toolMode, this.config.parallelToolCalling)
+        : undefined;
+
+      const request = buildAnthropicRequest({
+        model: model.id,
+        conversion,
+        maxTokens: safeMaxOutputTokens,
+        temperature,
+        tools: anthropicTools,
+        toolChoice,
+        extraOptions: mergedExtras,
+      });
+
+      this.outputChannel.appendLine(
+        `[Anthropic] final request: max_tokens=${request.max_tokens}` +
+        (request.temperature !== undefined ? ` temperature=${request.temperature}` : '') +
+        (request.thinking ? ` thinking=${JSON.stringify(request.thinking)}` : '') +
+        ` tools=${anthropicTools?.length ?? 0}`
+      );
+
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[Anthropic] Request body: ${JSON.stringify(request).slice(0, 2000)}…`
+        );
+      }
+
+      // 7. Create Anthropic SDK client + stream
+      const anthropicClient = createAnthropicClient(
+        this.config.serverUrl,
+        this.config.apiKey,
+        this.config.customHeaders
+      );
+
+      // Always-on: dump a reproducible curl command for the Anthropic request.
+      // Reuses the same logReproducibleCurl as the OpenAI path.
+      const anthropicUrl = this.config.serverUrl.replace(/\/$/, '').replace(/\/v1$/i, '') + '/v1/messages';
+      this.client.logReproducibleCurl(anthropicUrl, request as unknown as Record<string, unknown>);
+
+      const reporter = this.createStreamReporter(progress, (usage) => {
+        capturedUsage = usage;
+      });
+
+      const sdkStream = await anthropicClient.messages.create(request);
+
+      const stats = await streamAnthropicResponse({
+        stream: sdkStream as AsyncIterable<import('@anthropic-ai/sdk/resources').RawMessageStreamEvent>,
+        reporter,
+        isCancelled: () => token.isCancellationRequested,
+        resolveToolCallArgs: (toolCall) => this.resolveToolCallArgs(toolCall, toolSchemas),
+        captureContent: false,
+        log: this.config.verboseLogging
+          ? (msg) => this.outputChannel.appendLine(msg)
+          : undefined,
+      });
+
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[Anthropic] Completed: ${stats.totalContentLength} chars, ` +
+          `${stats.totalTextParts} text parts, ${stats.totalToolCalls} tool calls` +
+          (stats.hadThinking ? ', had thinking' : '')
+        );
+      }
+
+      if (isEmptyStreamResult(stats)) {
+        this.outputChannel.appendLine(
+          `[Anthropic] WARNING: Empty response from model ${model.id}`
+        );
+      }
+
       this.recordCompletedRequest(model.id, modelName, capturedUsage);
       this._onDidChangeRequestState.fire({
         kind: 'complete',
@@ -1572,6 +1804,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       perModelSettings: config.get<Record<string, Record<string, unknown>>>('perModelSettings', {}) ?? {},
       stripFakeToolCallText: config.get<boolean>('stripFakeToolCallText', true),
       retryFakeToolCalls: config.get<boolean>('retryFakeToolCalls', true),
+      useAnthropicNative: config.get<boolean>('useAnthropicNative', true),
     };
 
     const MAX_INT32 = 2147483647; // Maximum value for setTimeout (signed 32-bit integer)

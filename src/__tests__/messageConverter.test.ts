@@ -258,19 +258,26 @@ describe('stripFakeToolCallText', () => {
 
   test('strips the "Completed tool calls" block from assistant text (idx-535 form)', () => {
     // Pure-text "fake" tool call: the seed of the self-poisoning loop.
+    // New behavior: synthesize structured tool_call + synthetic tool result.
     const polluted =
       '`KnowledgePanel.tsx` deep uses currentStage…\n\nCompleted tool calls:\n- read_file (call_91e3b9d70b8c4be0a4d3c1f7) {"endLine":205,"filePath":"/x/y.tsx","startLine":170}\n';
     const out = stripFakeToolCallText([{ role: 'assistant', content: polluted }]);
-    assert.equal(out.length, 1);
-    const cleaned = (out[0] as { content: string }).content;
-    assert.ok(!/Completed tool calls/.test(cleaned), 'header still present');
-    assert.ok(!/call_91e3b9d70b8c4be0a4d3c1f7/.test(cleaned), 'call id still present');
-    assert.ok(/KnowledgePanel\.tsx/.test(cleaned), 'human-readable prose was stripped');
+    // 1 assistant message + 1 synthetic tool result
+    assert.equal(out.length, 2);
+    const assistantMsg = out[0] as { content: string; tool_calls: Array<{ id: string }> };
+    assert.ok(!/Completed tool calls/.test(assistantMsg.content), 'header still present');
+    assert.ok(!/call_91e3b9d70b8c4be0a4d3c1f7/.test(assistantMsg.content), 'call id still present');
+    assert.ok(/KnowledgePanel\.tsx/.test(assistantMsg.content), 'human-readable prose was stripped');
+    assert.equal(assistantMsg.tool_calls.length, 1, 'synthesized tool_call present');
+    assert.equal(assistantMsg.tool_calls[0].id, 'call_91e3b9d70b8c4be0a4d3c1f7');
+    assert.equal((out[1] as { role: string }).role, 'tool');
   });
 
   test('preserves real tool_calls when stripping coexisting text block (idx-537 form)', () => {
-    // Hybrid: model emitted real tool_calls AND echoed them as text. We must
-    // strip only the text — losing tool_calls would orphan the next tool turn.
+    // Hybrid: model emitted real tool_calls AND echoed them as text. We
+    // strip the text and dedupe by id — synthesizing the same id again would
+    // produce a duplicate tool_call, and the real tool result will follow in
+    // history (we don't double-emit a synthetic result).
     const realToolCall = {
       id: 'call_a6f7e54b2eaa4b9c812a2cae',
       type: 'function',
@@ -283,17 +290,20 @@ describe('stripFakeToolCallText', () => {
       tool_calls: [realToolCall],
     };
     const out = stripFakeToolCallText([msg]);
+    // Since parsed id matches existing real tool_call id, we dedupe and don't
+    // insert a synthetic tool result. Only 1 assistant message in output.
     assert.equal(out.length, 1);
     const cleaned = out[0] as { content: string; tool_calls: unknown[] };
     assert.ok(!/Completed tool calls/.test(cleaned.content));
-    assert.deepEqual(cleaned.tool_calls, [realToolCall], 'real tool_calls must survive');
+    assert.deepEqual(cleaned.tool_calls, [realToolCall], 'real tool_calls must survive without duplication');
     assert.ok(/FewshotSection/.test(cleaned.content));
   });
 
-  test('keeps message when content becomes empty but tool_calls remain', () => {
+  test('keeps message when content becomes empty but tool_calls remain (idx-537 hybrid)', () => {
     // Edge case: the assistant only wrote the fake summary and nothing else,
     // but the structured tool_calls field is still there. Dropping the
     // message would break the tool_call_id <-> next tool message linkage.
+    // The parsed id matches the real one → dedupe → no synthetic tool result.
     const realToolCall = {
       id: 'call_deadbeef00000000000000',
       type: 'function',
@@ -310,16 +320,27 @@ describe('stripFakeToolCallText', () => {
     assert.equal((out[0] as { content: string }).content, '');
   });
 
-  test('drops fully-empty assistant message with no tool_calls', () => {
-    // Pure pollution, nothing to keep. Removing it shortens history without
-    // breaking any tool_call_id linkage (there was none).
+  test('transforms pure-pollution assistant message into structured tool_calls + tool result', () => {
+    // Even when the assistant content is *only* fake-toolcall text, we no
+    // longer drop the message — we synthesize structured tool_calls + a
+    // synthetic tool result so the LLM sees a completed call instead of
+    // an unanswered one (which would trigger a retry loop).
     const out = stripFakeToolCallText([
       {
         role: 'assistant',
         content: 'Completed tool calls:\n- foo (call_aaaaaaaaaaaaaaaaaaaaaaaa) {}\n',
       },
     ]);
-    assert.equal(out.length, 0);
+    assert.equal(out.length, 2);
+    const assistantMsg = out[0] as Record<string, unknown>;
+    assert.equal(assistantMsg.role, 'assistant');
+    assert.equal(assistantMsg.content, '');
+    const toolCalls = assistantMsg.tool_calls as Array<Record<string, unknown>>;
+    assert.equal(toolCalls.length, 1);
+    assert.equal(toolCalls[0].id, 'call_aaaaaaaaaaaaaaaaaaaaaaaa');
+    const toolMsg = out[1] as Record<string, unknown>;
+    assert.equal(toolMsg.role, 'tool');
+    assert.equal(toolMsg.tool_call_id, 'call_aaaaaaaaaaaaaaaaaaaaaaaa');
   });
 
   test('does not touch user or tool messages even if they contain the marker', () => {
@@ -358,7 +379,7 @@ describe('stripFakeToolCallText', () => {
     assert.equal(cleaned.trim(), 'doing stuff');
   });
 
-  test('logs a single summary line when blocks are stripped', () => {
+  test('logs summary lines when blocks are stripped and synthesized', () => {
     const logs: string[] = [];
     stripFakeToolCallText(
       [
@@ -373,8 +394,61 @@ describe('stripFakeToolCallText', () => {
       ],
       (m) => logs.push(m)
     );
-    assert.equal(logs.length, 1);
+    // Two log lines now: strip summary + synthesized summary.
+    assert.equal(logs.length, 2);
     assert.match(logs[0], /Stripped "Completed tool calls" text from 2 assistant message/);
+    assert.match(logs[1], /Synthesized 2 structured tool_call/);
+  });
+
+  test('synthesizes structured tool_calls + tool results from bullet text', () => {
+    const out = stripFakeToolCallText([
+      {
+        role: 'assistant',
+        content:
+          'analysis\n\nCompleted tool calls:\n' +
+          '- read_file (call_abcdef0123456789abcdef01) {"filePath":"/x.ts"}\n',
+      },
+    ]);
+    // assistant message kept + structured tool_calls added + synthetic tool result inserted
+    assert.equal(out.length, 2);
+    const assistantMsg = out[0] as Record<string, unknown>;
+    assert.equal(assistantMsg.role, 'assistant');
+    assert.equal(assistantMsg.content, 'analysis');
+    const toolCalls = assistantMsg.tool_calls as Array<Record<string, unknown>>;
+    assert.equal(toolCalls.length, 1);
+    assert.equal(toolCalls[0].id, 'call_abcdef0123456789abcdef01');
+    assert.equal((toolCalls[0].function as Record<string, unknown>).name, 'read_file');
+    const toolMsg = out[1] as Record<string, unknown>;
+    assert.equal(toolMsg.role, 'tool');
+    assert.equal(toolMsg.tool_call_id, 'call_abcdef0123456789abcdef01');
+    assert.match(toolMsg.content as string, /Synthesized by LLM Gateway/);
+  });
+
+  test('synthesizes structured tool_calls + tool results from <invoke> XML', () => {
+    const out = stripFakeToolCallText([
+      {
+        role: 'assistant',
+        content:
+          'analysis text\n' +
+          '<invoke name="read_file">\n' +
+          '<parameter name="filePath">/x.ts</parameter>\n' +
+          '<parameter name="startLine">10</parameter>\n' +
+          '</invoke>',
+      },
+    ]);
+    assert.equal(out.length, 2);
+    const assistantMsg = out[0] as Record<string, unknown>;
+    assert.equal(assistantMsg.role, 'assistant');
+    assert.equal(assistantMsg.content, 'analysis text');
+    const toolCalls = assistantMsg.tool_calls as Array<Record<string, unknown>>;
+    assert.equal(toolCalls.length, 1);
+    assert.equal((toolCalls[0].function as Record<string, unknown>).name, 'read_file');
+    const args = JSON.parse((toolCalls[0].function as Record<string, unknown>).arguments as string);
+    assert.equal(args.filePath, '/x.ts');
+    assert.equal(args.startLine, 10);
+    const toolMsg = out[1] as Record<string, unknown>;
+    assert.equal(toolMsg.role, 'tool');
+    assert.match(toolMsg.content as string, /Synthesized by LLM Gateway/);
   });
 });
 

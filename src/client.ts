@@ -625,7 +625,7 @@ export class GatewayClient {
    * is written to a workspace-local tmp file to avoid shell quoting issues
    * with large JSON payloads.
    */
-  private logReproducibleCurl(url: string, request: OpenAIChatCompletionRequest): void {
+  public logReproducibleCurl(url: string, request: Record<string, unknown>): void {
     try {
       const headers = { ...this.getHeaders(), 'Content-Type': 'application/json' };
       const maskedHeaders = Object.entries(headers).map(([k, v]) => {
@@ -635,10 +635,13 @@ export class GatewayClient {
         }
         return `-H '${k}: ${v}'`;
       });
+      // Only inject stream_options for OpenAI-style requests. Anthropic uses
+      // a different mechanism for usage reporting and rejects unknown fields.
+      const isAnthropicEndpoint = url.includes('/messages');
       const body = JSON.stringify({
         ...request,
         stream: true,
-        stream_options: { ...(request.stream_options as object | undefined), include_usage: true },
+        ...(isAnthropicEndpoint ? {} : { stream_options: { ...(request.stream_options as object | undefined), include_usage: true } }),
       });
 
       // For large bodies, write to the extension's own tmp/ directory;

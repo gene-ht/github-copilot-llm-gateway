@@ -131,4 +131,14 @@ export interface GatewayConfig {
   perModelSettings: Record<string, Record<string, unknown>>;
   stripFakeToolCallText: boolean;
   retryFakeToolCalls: boolean;
+  /**
+   * When true (default), route requests for Claude models to the upstream's
+   * `/v1/messages` (Anthropic Messages API) instead of `/v1/chat/completions`.
+   * This eliminates the lossy OpenAI→Anthropic translation on the upstream
+   * side and resolves tool-call self-poisoning, tool-pairing errors, and
+   * `<invoke>` XML issues. Non-Claude models always use the OpenAI path.
+   *
+   * Can be overridden per model via `perModelSettings.<id>.transport`.
+   */
+  useAnthropicNative: boolean;
 }

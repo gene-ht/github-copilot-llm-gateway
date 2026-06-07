@@ -12,6 +12,11 @@
  */
 
 import { OpenAIMessage } from './types';
+import {
+  parseFakeToolCalls,
+  parseAnthropicXmlToolCalls,
+  ParsedFakeToolCall,
+} from './fakeToolCallParser';
 
 export type NormalizedRole = 'user' | 'assistant' | 'system' | 'tool';
 
@@ -219,6 +224,22 @@ const ANTHROPIC_XML_TOOL_CALL_RE =
   /(?:^|\n)[ \t]*(?:call[ \t]*\n[ \t]*)?<invoke\s+name=["'][^"']+["']\s*>[\s\S]*?<\/invoke>[ \t]*\n?/g;
 
 /**
+ * Strip fake-toolcall text patterns from a string. Used by both the OpenAI
+ * message-level stripper and the Anthropic converter to clean assistant text
+ * before sending to the model.
+ */
+export function stripPoisonText(text: string): string {
+  FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+  ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+  let cleaned = text
+    .replace(FAKE_TOOL_CALL_TEXT_RE, '\n')
+    .replace(ANTHROPIC_XML_TOOL_CALL_RE, '\n');
+  FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
+  ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
+  return cleaned.trim();
+}
+
+/**
  * Returns true when the given text contains either known fake-toolcall
  * format (Copilot's "Completed tool calls:" block or Anthropic-style
  * `<invoke>` XML). Useful for detecting self-poisoning in streaming output
@@ -237,22 +258,44 @@ export function containsFakeToolCallText(text: string): boolean {
 }
 
 /**
- * Strip "Completed tool calls: …" textual summaries from assistant content.
+ * Transform fake-toolcall text in historical assistant messages into
+ * structured `tool_calls` + synthetic `tool` result messages.
  *
- * Some Copilot Chat clients/agents embed a human-readable summary of executed
- * tool calls into the assistant message's `content` *in addition to* (or
- * sometimes instead of) the structured `tool_calls` field. When that text is
- * fed back in subsequent turns, models — especially under long contexts —
- * start mimicking the format and emit tool calls as plain text, skipping
- * actual execution.
+ * ## Background
  *
- * Removing the textual block leaves the structured `tool_calls` field intact
- * (this function never touches it), so real tool-call semantics are preserved
- * while the few-shot poisoning trigger is removed.
+ * Some Copilot Chat clients/agents embed tool calls as plain text in the
+ * assistant's `content` field instead of (or in addition to) the structured
+ * `tool_calls` field. Two formats observed:
  *
- * Only affects assistant messages with string content. Messages that become
- * empty after stripping are dropped entirely (rare — usually the assistant
- * also has its own analysis text).
+ *   1. Copilot bullet:  `Completed tool calls:\n- foo (call_xxx) {...}`
+ *   2. Anthropic XML:   `<invoke name="foo"><parameter ...>...</invoke>`
+ *
+ * When those texts are fed back as history, they become a few-shot example
+ * teaching the model to keep writing tool calls as text — and worse, since
+ * no structured `tool_calls` exists, the LLM thinks its previous turn never
+ * actually invoked anything, prompting it to retry. This causes a
+ * **retry loop**: every turn the LLM re-writes the same fake call, the
+ * client never executes it (because it's text), and Copilot keeps retrying.
+ *
+ * ## Fix
+ *
+ * For each affected assistant message we:
+ *
+ *   1. Parse the fake-toolcall text back into structured calls (`{id, name,
+ *      arguments}`) using the existing parsers.
+ *   2. Strip the text from `content`.
+ *   3. Set `tool_calls` on the assistant message to the parsed calls (or
+ *      merge with existing `tool_calls` if the assistant already had some).
+ *   4. Insert synthetic `tool` role messages right after the assistant
+ *      message — one per parsed call — with a placeholder content. This is
+ *      required by the OpenAI/Anthropic protocol (every tool_call must have
+ *      a matching tool result in history) and signals to the LLM that the
+ *      call already completed, so it won't retry.
+ *
+ * ## Placeholder content
+ *
+ * Since the original tool result is gone (it was textual and never executed),
+ * we inject a short marker. The LLM treats this as the result and moves on.
  */
 export function stripFakeToolCallText(
   messages: readonly OpenAIMessage[],
@@ -260,6 +303,7 @@ export function stripFakeToolCallText(
 ): OpenAIMessage[] {
   let strippedBulletCount = 0;
   let strippedXmlCount = 0;
+  let synthesizedCallCount = 0;
   const result: OpenAIMessage[] = [];
 
   for (const msg of messages) {
@@ -281,27 +325,79 @@ export function stripFakeToolCallText(
       continue;
     }
 
+    // Parse BEFORE stripping so we can transform text → structured calls.
+    const parsedCalls: ParsedFakeToolCall[] = [];
+    if (hasBullet) {
+      parsedCalls.push(...parseFakeToolCalls(content));
+      strippedBulletCount++;
+    }
+    if (hasXml) {
+      parsedCalls.push(...parseAnthropicXmlToolCalls(content));
+      strippedXmlCount++;
+    }
+
+    // Strip text from content.
     FAKE_TOOL_CALL_TEXT_RE.lastIndex = 0;
     ANTHROPIC_XML_TOOL_CALL_RE.lastIndex = 0;
     let cleaned = content;
     if (hasBullet) {
       cleaned = cleaned.replace(FAKE_TOOL_CALL_TEXT_RE, '\n');
-      strippedBulletCount++;
     }
     if (hasXml) {
       cleaned = cleaned.replace(ANTHROPIC_XML_TOOL_CALL_RE, '\n');
-      strippedXmlCount++;
     }
     cleaned = cleaned.trim();
 
-    // If the assistant message had a real tool_calls field, keep it even
-    // when the human-readable part became empty — the structured call is
-    // what actually drives the next-turn tool/role message.
-    const hasToolCalls = Array.isArray((msg as Record<string, unknown>).tool_calls)
-      && ((msg as Record<string, unknown>).tool_calls as unknown[]).length > 0;
+    // Merge parsed calls with existing tool_calls. Dedupe by id — if the
+    // assistant already has a real tool_call with the same id as a parsed
+    // text bullet (idx-537 hybrid form), the real one wins and we skip the
+    // synthetic copy + result (the real tool result will follow naturally).
+    const existingToolCalls = Array.isArray((msg as Record<string, unknown>).tool_calls)
+      ? ((msg as Record<string, unknown>).tool_calls as Array<Record<string, unknown>>)
+      : [];
+    const existingIds = new Set(
+      existingToolCalls
+        .map((tc) => (typeof tc.id === 'string' ? tc.id : ''))
+        .filter((id) => id.length > 0)
+    );
 
-    if (cleaned.length > 0 || hasToolCalls) {
-      result.push({ ...msg, content: cleaned });
+    const newSyntheticCalls = parsedCalls
+      .filter((p) => !existingIds.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        type: 'function' as const,
+        function: { name: p.name, arguments: p.arguments },
+      }));
+
+    // Emit the assistant message with merged tool_calls.
+    const allToolCalls = [...existingToolCalls, ...newSyntheticCalls];
+    const newMsg: Record<string, unknown> = { ...msg, content: cleaned };
+    if (allToolCalls.length > 0) {
+      newMsg.tool_calls = allToolCalls;
+    }
+    // Drop the assistant message entirely only if content is empty AND no
+    // tool_calls.
+    if (cleaned.length > 0 || allToolCalls.length > 0) {
+      result.push(newMsg as OpenAIMessage);
+    }
+
+    // Inject synthetic tool result messages — only for the *new* synthetic
+    // calls. Existing real tool_calls have their own tool result messages
+    // following in history (we don't double-emit).
+    //
+    // The chat-completions protocol requires every tool_call in an assistant
+    // message to have a matching tool message following it. Without these
+    // synthetic results, the LLM sees an unanswered tool call and retries.
+    for (const call of newSyntheticCalls) {
+      result.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content:
+          '[Synthesized by LLM Gateway: the model wrote this tool call as plain text ' +
+          'in a previous turn, so it was not actually executed. Treat this call as a ' +
+          'no-op and continue.]',
+      } as OpenAIMessage);
+      synthesizedCallCount++;
     }
   }
 
@@ -310,6 +406,12 @@ export function stripFakeToolCallText(
   }
   if (strippedXmlCount > 0) {
     log(`Stripped Anthropic <invoke> XML from ${strippedXmlCount} assistant message(s)`);
+  }
+  if (synthesizedCallCount > 0) {
+    log(
+      `Synthesized ${synthesizedCallCount} structured tool_call(s) + tool result(s) ` +
+      'from fake-toolcall text to break self-poisoning retry loop'
+    );
   }
   return result;
 }

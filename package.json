@@ -2,7 +2,7 @@
   "name": "github-copilot-llm-gateway-v2",
   "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.5.4",
+  "version": "1.6.0",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -98,7 +98,7 @@
       },
       {
         "command": "github.copilot.llm-gateway.copilotProxySettings",
-        "title": "Copilot Proxy Settings",
+        "title": "Proxy Server",
         "category": "GitHub Copilot LLM Gateway"
       },
       {
@@ -107,8 +107,8 @@
         "category": "GitHub Copilot LLM Gateway"
       },
       {
-        "command": "github.copilot.llm-gateway.copilotMemorySettings",
-        "title": "Copilot Memory Settings",
+        "command": "github.copilot.llm-gateway.copilotSystemSettings",
+        "title": "Copilot System Config",
         "category": "GitHub Copilot LLM Gateway"
       }
     ],
@@ -190,6 +190,12 @@
           "description": "When the model writes tool calls as plain text instead of using the function calling mechanism, automatically inject a correction prompt and retry the request. This recovers tool execution in the current turn rather than waiting for history cleanup in the next turn. Only one retry is attempted to avoid infinite loops.",
           "order": 12
         },
+        "github.copilot.llm-gateway.useAnthropicNative": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, route requests for Claude models to the upstream's /v1/messages (Anthropic Messages API) instead of /v1/chat/completions (OpenAI format). This eliminates lossy format translation and resolves tool-call self-poisoning. Disable to force all models through the OpenAI-compatible endpoint. Can also be overridden per model via perModelSettings.<id>.transport ('openai' or 'anthropic').",
+          "order": 13
+        },
         "github.copilot.llm-gateway.customHeaders": {
           "type": "object",
           "default": {},
@@ -229,7 +235,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "markdownDescription": "Map Copilot model names to upstream model names for the proxy server. Use the **Copilot Proxy Settings** command to pick from available upstream models.\n\nExample:\n```json\n{\n  \"gpt-4o-mini\": \"your-fast-model\",\n  \"gpt-4.1-2025-04-14\": \"your-main-model\"\n}\n```",
+          "markdownDescription": "Map Copilot model names to upstream model names for the proxy server. Use the **Proxy Server** command to pick from available upstream models.\n\nExample:\n```json\n{\n  \"gpt-4o-mini\": \"your-fast-model\",\n  \"gpt-4.1-2025-04-14\": \"your-main-model\"\n}\n```",
           "order": 21
         }
       }
@@ -246,6 +252,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.101.0",
     "undici": "^8.3.0"
   }
 }
