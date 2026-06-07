@@ -157,6 +157,67 @@ export function serializeTools(
 }
 
 // ============================================================================
+// Tool result pairing repair
+// ============================================================================
+
+/**
+ * Strip orphaned `tool_result` parts whose matching `tool_call` (by `callId`)
+ * doesn't appear in any earlier message.
+ *
+ * VS Code / Copilot truncates conversation history, which can leave
+ * `tool_result` parts at the start of the window whose corresponding
+ * `tool_call` was dropped. Anthropic rejects these with:
+ *   "unexpected tool_use_id found in tool_result blocks"
+ *
+ * This function scans forward, collecting all known `tool_call` callIds, then
+ * strips any `tool_result` whose callId wasn't seen as a `tool_call` in a
+ * preceding message. Empty messages (all parts stripped) are removed.
+ */
+export function repairToolResultPairing(
+  messages: LmMessagePayload[],
+  log: (message: string) => void
+): LmMessagePayload[] {
+  // Pass 1: collect all tool_call callIds by message index
+  const toolCallIds = new Set<string>();
+  const result: LmMessagePayload[] = [];
+  let strippedCount = 0;
+
+  for (const msg of messages) {
+    // First, register any tool_call callIds in this message
+    for (const part of msg.content) {
+      if (part.type === 'tool_call') {
+        toolCallIds.add(part.callId);
+      }
+    }
+
+    // Then, filter out orphaned tool_result parts
+    const filteredContent = msg.content.filter((part) => {
+      if (part.type === 'tool_result') {
+        if (!toolCallIds.has(part.callId)) {
+          strippedCount++;
+          return false;
+        }
+      }
+      return true;
+    });
+
+    // Keep the message if it still has content
+    if (filteredContent.length > 0) {
+      result.push({ ...msg, content: filteredContent });
+    }
+  }
+
+  if (strippedCount > 0) {
+    log(
+      `[lm-passthrough] Stripped ${strippedCount} orphaned tool_result part(s) ` +
+      `(${messages.length} → ${result.length} messages)`
+    );
+  }
+
+  return result;
+}
+
+// ============================================================================
 // SSE response events
 // ============================================================================
 
@@ -217,9 +278,11 @@ export async function streamLmPassthrough(
   };
 
   // 1. Build request body
+  const serialized = serializeMessages(messages);
+  const repairedMessages = repairToolResultPairing(serialized, log);
   const body: LmChatRequest = {
     model,
-    messages: serializeMessages(messages),
+    messages: repairedMessages,
     tools: serializeTools(tools),
   };
 

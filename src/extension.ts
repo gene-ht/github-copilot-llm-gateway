@@ -384,43 +384,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     async () => {
       const pick = await vscode.window.showQuickPick(
         [
+          { label: '$(star-full) Recommended Preset', description: 'One-click: LM passthrough + sub-agents + memory', id: 'recommendedPreset' },
           { label: '$(server) Configure Server', description: 'Set server URL and API key', id: 'server' },
-          { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
-          { label: '$(globe) Proxy Server', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },
-          { label: '$(symbol-class) Sub-agent Settings', description: 'Configure Copilot sub-agents to use Gateway models', id: 'subagentSettings' },
-          { label: '$(settings-gear) Copilot System Config', description: 'Memory, Anthropic native transport, and other system toggles', id: 'copilotSystem' },
           { label: '$(edit) Edit Custom Headers', description: 'Manage HTTP headers (stored in secret storage)', id: 'headers' },
-          { label: '$(settings-gear) Open Settings', description: 'All LLM Gateway settings', id: 'settings' },
           { label: '$(refresh) Refresh Models', description: 'Re-fetch model list from server', id: 'refresh' },
+          { label: '$(tools) Advanced Settings', description: 'Model, sub-agent, system config, proxy', id: 'advanced' },
+          { label: '$(settings-gear) Open Settings', description: 'All LLM Gateway settings', id: 'settings' },
         ],
         { title: 'LLM Gateway', placeHolder: 'Choose an action' }
       );
       if (!pick) { return; }
 
       switch (pick.id) {
+        case 'recommendedPreset':
+          await applyRecommendedPreset(provider);
+          break;
         case 'server':
           await configureServerFlow(provider, refreshStatusBar);
-          break;
-        case 'modelSettings':
-          await vscode.commands.executeCommand('github.copilot.llm-gateway.modelSettings');
-          break;
-        case 'copilotProxy':
-          await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotProxySettings');
-          break;
-        case 'subagentSettings':
-          await vscode.commands.executeCommand('github.copilot.llm-gateway.subagentSettings');
-          break;
-        case 'copilotSystem':
-          await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotSystemSettings');
           break;
         case 'headers':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.editCustomHeaders');
           break;
-        case 'settings':
-          await vscode.commands.executeCommand('workbench.action.openSettings', 'github.copilot.llm-gateway');
-          break;
         case 'refresh':
           await vscode.commands.executeCommand('github.copilot.llm-gateway.refreshModels');
+          break;
+        case 'advanced':
+          await advancedSettingsFlow(provider);
+          break;
+        case 'settings':
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'github.copilot.llm-gateway');
           break;
       }
     }
@@ -888,6 +880,109 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
       continue;
     }
   }
+}
+
+// ---------- Advanced Settings (second-level menu) ----------
+
+/**
+ * Advanced Settings submenu — groups Model Settings, Sub-agent Settings,
+ * Copilot System Config, and Proxy Server into a single secondary menu
+ * to keep the top-level manage menu clean.
+ */
+async function advancedSettingsFlow(_provider: GatewayProvider): Promise<void> {
+  const pick = await vscode.window.showQuickPick(
+    [
+      { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
+      { label: '$(symbol-class) Sub-agent Settings', description: 'Configure Copilot sub-agents to use Gateway models', id: 'subagentSettings' },
+      { label: '$(settings-gear) Copilot System Config', description: 'Memory, LM passthrough, transport toggles', id: 'copilotSystem' },
+      { label: '$(globe) Proxy Server', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },
+    ],
+    { title: 'LLM Gateway — Advanced Settings', placeHolder: 'Choose an advanced setting' }
+  );
+
+  if (!pick) { return; }
+
+  switch (pick.id) {
+    case 'modelSettings':
+      await vscode.commands.executeCommand('github.copilot.llm-gateway.modelSettings');
+      break;
+    case 'subagentSettings':
+      await vscode.commands.executeCommand('github.copilot.llm-gateway.subagentSettings');
+      break;
+    case 'copilotSystem':
+      await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotSystemSettings');
+      break;
+    case 'copilotProxy':
+      await vscode.commands.executeCommand('github.copilot.llm-gateway.copilotProxySettings');
+      break;
+  }
+}
+
+// ---------- Recommended Preset (one-click configuration) ----------
+
+/**
+ * Apply the recommended preset configuration in one click:
+ *
+ *   1. LM Passthrough: ON
+ *   2. Anthropic Native Transport: OFF (redundant when passthrough is on)
+ *   3. Search Sub-agent: ON  (model="" → inherits parent/main session model)
+ *   4. Execution Sub-agent: ON (model="" → inherits parent/main session model)
+ *   5. Write Copilot Memory: ON
+ *   6. Read Copilot Memory: ON
+ *   7. Default Model: cleared (sub-agents dynamically follow the chat model)
+ *
+ * By clearing `chat.exploreAgent.defaultModel` and setting each sub-agent's
+ * `model` to `""`, sub-agents inherit whatever model the user selects in the
+ * main chat session — no static pinning required.
+ */
+async function applyRecommendedPreset(provider: GatewayProvider): Promise<void> {
+  const confirm = await vscode.window.showQuickPick(
+    [
+      { label: '$(check) Apply Recommended Preset', id: 'apply' },
+      { label: '$(close) Cancel', id: 'cancel' },
+    ],
+    {
+      title: 'LLM Gateway — Recommended Preset',
+      placeHolder:
+        'This will: enable LM passthrough, enable sub-agents (following main model), ' +
+        'enable memory, and disable Anthropic native transport',
+    }
+  );
+
+  if (!confirm || confirm.id !== 'apply') { return; }
+
+  // 1. LM Passthrough: ON
+  const cfg = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
+  await cfg.update('useLmPassthrough', true, vscode.ConfigurationTarget.Global);
+
+  // 2. Anthropic Native Transport: OFF
+  await cfg.update('useAnthropicNative', false, vscode.ConfigurationTarget.Global);
+
+  // 3. Search Sub-agent: ON + model="" (inherit parent) + useAgenticProxy=false
+  await writeVSCodeSetting('github.copilot.chat.searchSubagent.enabled', true);
+  await writeVSCodeSetting('github.copilot.chat.searchSubagent.useAgenticProxy', false);
+  await writeVSCodeSetting('github.copilot.chat.searchSubagent.model', '');
+
+  // 4. Execution Sub-agent: ON + model="" (inherit parent)
+  await writeVSCodeSetting('github.copilot.chat.executionSubagent.enabled', true);
+  await writeVSCodeSetting('github.copilot.chat.executionSubagent.model', '');
+
+  // 5. Write Copilot Memory: ON
+  await writeVSCodeSetting('github.copilot.chat.tools.memory.enabled', true);
+
+  // 6. Read Copilot Memory: ON
+  await writeVSCodeSetting('github.copilot.chat.copilotMemory.enabled', true);
+
+  // 7. Default Model: clear (sub-agents follow main chat model dynamically)
+  await writeVSCodeSetting('chat.exploreAgent.defaultModel', undefined);
+
+  // Force config reload so provider picks up the new useLmPassthrough value
+  provider.refreshModels();
+
+  vscode.window.showInformationMessage(
+    'LLM Gateway: Recommended preset applied ✓ — ' +
+    'LM passthrough ON, sub-agents ON (following main model), memory ON'
+  );
 }
 
 // ---------- Copilot System Config (top-level menu) ----------

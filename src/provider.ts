@@ -610,9 +610,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
        this.config.useLmPassthrough);
 
     if (useLmPassthroughTransport) {
-      this.outputChannel.appendLine(
-        `[transport=lm-passthrough] Using LM passthrough for ${model.id}`
-      );
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[transport=lm-passthrough] Using LM passthrough for ${model.id}`
+        );
+      }
       return this.handleLmPassthroughRequest(model, messages, options, progress, token, modelName);
     }
 
@@ -1003,10 +1005,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     modelName: string
   ): Promise<void> {
     try {
-      this.outputChannel.appendLine(
-        `[lm-passthrough] model=${model.id} ` +
-        `messages=${messages.length} tools=${options.tools?.length ?? 0}`
-      );
+      if (this.config.verboseLogging) {
+        this.outputChannel.appendLine(
+          `[lm-passthrough] model=${model.id} ` +
+          `messages=${messages.length} tools=${options.tools?.length ?? 0}`
+        );
+      }
 
       const stats = await streamLmPassthrough({
         serverUrl: this.config.serverUrl,
