@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { GatewayClient } from './client';
+import { GatewayClient, normalizeBaseUrl } from './client';
 import { GatewayConfig, OpenAIChatCompletionRequest, OpenAIMessage } from './types';
 import {
   convertMessage,
@@ -34,7 +34,13 @@ import {
   streamResponse,
 } from './responseStreamer';
 import { dedupeModels, friendlyModelName } from './modelDisplay';
-import { streamLmPassthrough } from './lm-passthrough';
+import {
+  streamLmPassthrough,
+  serializeMessages,
+  serializeTools,
+  repairToolResultPairing,
+} from './lm-passthrough';
+import { isContextTooLongError, compactMessages } from './lm-compaction';
 import {
   isClaudeModel,
   convertMessagesToAnthropic,
@@ -1004,6 +1010,17 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     token: vscode.CancellationToken,
     modelName: string
   ): Promise<void> {
+    // Build the URL + serialized body for curl logging on error.
+    // We serialize here (same as streamLmPassthrough does internally) so the
+    // body is available in the catch block even when the stream throws.
+    const lmUrl = `${normalizeBaseUrl(this.config.serverUrl)}/v1/lm/chat`;
+    const logFn = (msg: string) => this.outputChannel.appendLine(msg);
+    const serializedBody = {
+      model: model.id,
+      messages: repairToolResultPairing(serializeMessages(messages), logFn),
+      tools: serializeTools(options.tools),
+    };
+
     try {
       if (this.config.verboseLogging) {
         this.outputChannel.appendLine(
@@ -1012,7 +1029,7 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         );
       }
 
-      const stats = await streamLmPassthrough({
+      const result = await streamLmPassthrough({
         serverUrl: this.config.serverUrl,
         apiKey: this.config.apiKey,
         customHeaders: this.config.customHeaders,
@@ -1022,14 +1039,14 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         tools: options.tools,
         progress,
         token,
-        log: (msg) => this.outputChannel.appendLine(msg),
+        log: logFn,
         verbose: this.config.verboseLogging,
       });
 
       if (this.config.verboseLogging) {
         this.outputChannel.appendLine(
-          `[lm-passthrough] Completed: ${stats.totalTextParts} text, ` +
-          `${stats.totalToolCalls} tool calls, ${stats.totalThinkingParts} thinking`
+          `[lm-passthrough] Completed: ${result.stats.totalTextParts} text, ` +
+          `${result.stats.totalToolCalls} tool calls, ${result.stats.totalThinkingParts} thinking`
         );
       }
 
@@ -1040,6 +1057,63 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         modelName,
       });
     } catch (error) {
+      // ── Context too long → attempt compaction + retry ──────────────
+      if (isContextTooLongError(error)) {
+        this.outputChannel.appendLine(
+          `[compaction] Context too long for ${model.id}, attempting compaction...`
+        );
+
+        try {
+          const compacted = await compactMessages(
+            messages,
+            model.id,
+            token,
+            logFn,
+          );
+
+          if (compacted) {
+            // Retry with compacted messages
+            const retryResult = await streamLmPassthrough({
+              serverUrl: this.config.serverUrl,
+              apiKey: this.config.apiKey,
+              customHeaders: this.config.customHeaders,
+              requestTimeout: this.config.requestTimeout,
+              model: model.id,
+              messages: compacted,
+              tools: options.tools,
+              progress,
+              token,
+              log: logFn,
+              verbose: this.config.verboseLogging,
+            });
+
+            if (this.config.verboseLogging) {
+              this.outputChannel.appendLine(
+                `[compaction] Retry succeeded: ${retryResult.stats.totalTextParts} text, ` +
+                `${retryResult.stats.totalToolCalls} tool calls`
+              );
+            }
+
+            this.recordCompletedRequest(model.id, modelName, undefined);
+            this._onDidChangeRequestState.fire({
+              kind: 'complete',
+              modelId: model.id,
+              modelName,
+            });
+            return; // Compaction + retry succeeded
+          }
+        } catch (compactionError) {
+          this.outputChannel.appendLine(
+            `[compaction] Compaction retry failed: ${compactionError instanceof Error ? compactionError.message : String(compactionError)}`
+          );
+          // Fall through to normal error handling with the original error
+        }
+      }
+
+      // ── Normal error path ─────────────────────────────────────────
+      // Log reproducible curl with the full serialized body (written to tmp
+      // file when large, same as OpenAI/Anthropic paths)
+      this.client.logReproducibleCurl(lmUrl, serializedBody as unknown as Record<string, unknown>);
       this._onDidChangeRequestState.fire({
         kind: 'error',
         modelId: model.id,

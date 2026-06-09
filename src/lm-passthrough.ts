@@ -162,54 +162,74 @@ export function serializeTools(
 
 /**
  * Strip orphaned `tool_result` parts whose matching `tool_call` (by `callId`)
- * doesn't appear in any earlier message.
+ * doesn't appear **anywhere** in earlier messages.
  *
  * VS Code / Copilot truncates conversation history, which can leave
  * `tool_result` parts at the start of the window whose corresponding
  * `tool_call` was dropped. Anthropic rejects these with:
  *   "unexpected tool_use_id found in tool_result blocks"
  *
- * This function scans forward, collecting all known `tool_call` callIds, then
- * strips any `tool_result` whose callId wasn't seen as a `tool_call` in a
- * preceding message. Empty messages (all parts stripped) are removed.
+ * This is a conservative repair: it only strips `tool_result` parts whose
+ * `callId` has no matching `tool_call` in the *entire preceding history*.
+ * It does NOT try to enforce Anthropic's strict "immediately preceding
+ * message" rule — that's the upstream Gateway's responsibility when it
+ * converts to Anthropic format.
+ *
+ * Also strips orphaned `tool_call` parts (at the end of the window)
+ * whose `callId` has no matching `tool_result` in any *later* message,
+ * to avoid the symmetric error.
+ *
+ * Empty messages (all parts stripped) are removed.
  */
 export function repairToolResultPairing(
   messages: LmMessagePayload[],
   log: (message: string) => void
 ): LmMessagePayload[] {
-  // Pass 1: collect all tool_call callIds by message index
-  const toolCallIds = new Set<string>();
-  const result: LmMessagePayload[] = [];
-  let strippedCount = 0;
-
+  // Pass 1: collect ALL tool_call and tool_result callIds across all messages
+  const allToolCallIds = new Set<string>();
+  const allToolResultIds = new Set<string>();
   for (const msg of messages) {
-    // First, register any tool_call callIds in this message
     for (const part of msg.content) {
       if (part.type === 'tool_call') {
-        toolCallIds.add(part.callId);
+        allToolCallIds.add(part.callId);
+      } else if (part.type === 'tool_result') {
+        allToolResultIds.add(part.callId);
       }
     }
+  }
 
-    // Then, filter out orphaned tool_result parts
+  // Pass 2: filter — strip tool_results with no matching tool_call,
+  // and tool_calls with no matching tool_result
+  const result: LmMessagePayload[] = [];
+  let strippedResults = 0;
+  let strippedCalls = 0;
+
+  for (const msg of messages) {
     const filteredContent = msg.content.filter((part) => {
       if (part.type === 'tool_result') {
-        if (!toolCallIds.has(part.callId)) {
-          strippedCount++;
+        if (!allToolCallIds.has(part.callId)) {
+          strippedResults++;
+          return false;
+        }
+      }
+      if (part.type === 'tool_call') {
+        if (!allToolResultIds.has(part.callId)) {
+          strippedCalls++;
           return false;
         }
       }
       return true;
     });
 
-    // Keep the message if it still has content
     if (filteredContent.length > 0) {
       result.push({ ...msg, content: filteredContent });
     }
   }
 
-  if (strippedCount > 0) {
+  if (strippedResults > 0 || strippedCalls > 0) {
     log(
-      `[lm-passthrough] Stripped ${strippedCount} orphaned tool_result part(s) ` +
+      `[lm-passthrough] Stripped ${strippedResults} orphaned tool_result + ` +
+      `${strippedCalls} orphaned tool_call part(s) ` +
       `(${messages.length} → ${result.length} messages)`
     );
   }
@@ -255,6 +275,12 @@ export interface LmPassthroughStats {
   totalThinkingParts: number;
 }
 
+export interface LmPassthroughResult {
+  stats: LmPassthroughStats;
+  /** The serialized request body, captured for error-time curl logging. */
+  requestBody: LmChatRequest;
+}
+
 /**
  * Send a chat request via the LM passthrough protocol and stream responses
  * back through the VS Code progress API.
@@ -265,7 +291,7 @@ export interface LmPassthroughStats {
  */
 export async function streamLmPassthrough(
   params: LmPassthroughParams
-): Promise<LmPassthroughStats> {
+): Promise<LmPassthroughResult> {
   const {
     serverUrl, apiKey, customHeaders, requestTimeout,
     model, messages, tools, progress, token, log, verbose,
@@ -279,7 +305,28 @@ export async function streamLmPassthrough(
 
   // 1. Build request body
   const serialized = serializeMessages(messages);
+  log(`[lm-passthrough] Serialized ${serialized.length} messages, running tool_result repair...`);
   const repairedMessages = repairToolResultPairing(serialized, log);
+  log(`[lm-passthrough] After repair: ${repairedMessages.length} messages`);
+
+  // Always-on diagnostic: report first message structure when it starts
+  // with tool_result (the most common cause of upstream 400 errors).
+  if (repairedMessages.length > 0) {
+    const firstMsg = repairedMessages[0];
+    const firstPartTypes = firstMsg.content.map((p) => p.type).join(', ');
+    if (firstMsg.content.some((p) => p.type === 'tool_result')) {
+      log(
+        `[lm-passthrough] WARNING: msg[0] still has tool_result after repair. ` +
+        `role=${firstMsg.role}, parts=[${firstPartTypes}]`
+      );
+      // Dump the orphaned tool_result callIds for debugging
+      const orphanIds = firstMsg.content
+        .filter((p) => p.type === 'tool_result')
+        .map((p) => (p as { callId: string }).callId);
+      log(`[lm-passthrough] Orphaned tool_result callIds: ${orphanIds.join(', ')}`);
+    }
+  }
+
   const body: LmChatRequest = {
     model,
     messages: repairedMessages,
@@ -386,7 +433,7 @@ export async function streamLmPassthrough(
                 `${stats.totalToolCalls} tool calls, ${stats.totalThinkingParts} thinking`
               );
             }
-            return stats;
+            return { stats, requestBody: body };
         }
       }
     }
@@ -398,7 +445,7 @@ export async function streamLmPassthrough(
         `${stats.totalToolCalls} tool calls, ${stats.totalThinkingParts} thinking`
       );
     }
-    return stats;
+    return { stats, requestBody: body };
   } finally {
     clearTimeout(timeoutId);
     cancelListener.dispose();
