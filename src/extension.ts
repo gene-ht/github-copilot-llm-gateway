@@ -780,12 +780,12 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
   while (true) {
     const items: SubagentPickItem[] = [];
 
-    // 1. Default model (chat.exploreAgent.defaultModel)
-    const exploreDefault = readVSCodeSetting('chat.exploreAgent.defaultModel');
+    // 1. Default model (github.copilot.chat.exploreAgent.model)
+    const exploreDefault = readVSCodeSetting('github.copilot.chat.exploreAgent.model');
     items.push({
-      label: '$(rocket) Default Model',
+      label: '$(rocket) Explore Agent Model',
       description: exploreDefault ? `→ ${exploreDefault}` : '(not set — Copilot default)',
-      detail: 'chat.exploreAgent.defaultModel — routes explore sub-agents through Gateway',
+      detail: 'github.copilot.chat.exploreAgent.model — routes explore sub-agents through Gateway',
       action: 'chooseDefault',
     });
 
@@ -925,31 +925,22 @@ async function advancedSettingsFlow(_provider: GatewayProvider): Promise<void> {
  *
  *   1. LM Passthrough: ON
  *   2. Anthropic Native Transport: OFF (redundant when passthrough is on)
- *   3. Search Sub-agent: ON  (model="" → inherits parent/main session model)
- *   4. Execution Sub-agent: ON (model="" → inherits parent/main session model)
- *   5. Write Copilot Memory: ON
- *   6. Read Copilot Memory: ON
- *   7. Default Model: cleared (sub-agents dynamically follow the chat model)
+ *   3. Search Sub-agent: ON  (model="" → inherits parent model)
+ *   4. Execution Sub-agent: ON (model="" → inherits parent model)
+ *   5. Plan/Ask/Implement sub-agents: model="" (inherit parent model)
+ *   6. Write Copilot Memory: ON
+ *   7. Read Copilot Memory: ON
  *
- * By clearing `chat.exploreAgent.defaultModel` and setting each sub-agent's
- * `model` to `""`, sub-agents inherit whatever model the user selects in the
- * main chat session — no static pinning required.
+ * Setting sub-agent `model` to `""` makes them inherit whatever model
+ * the user selects in the main chat session — no static pinning.
+ *
+ * NOTE: Explore Agent is NOT configured here because it has a hardcoded
+ * fallback model list and cannot inherit the parent model. To route
+ * Explore through Gateway, manually set `chat.exploreAgent.defaultModel`
+ * to a specific Gateway model name (e.g. `"auto (copilot-llm-gateway)"`).
  */
 async function applyRecommendedPreset(provider: GatewayProvider): Promise<void> {
-  const confirm = await vscode.window.showQuickPick(
-    [
-      { label: '$(check) Apply Recommended Preset', id: 'apply' },
-      { label: '$(close) Cancel', id: 'cancel' },
-    ],
-    {
-      title: 'LLM Gateway — Recommended Preset',
-      placeHolder:
-        'This will: enable LM passthrough, enable sub-agents (following main model), ' +
-        'enable memory, and disable Anthropic native transport',
-    }
-  );
-
-  if (!confirm || confirm.id !== 'apply') { return; }
+  // Apply all settings immediately — no confirmation needed
 
   // 1. LM Passthrough: ON
   const cfg = vscode.workspace.getConfiguration('github.copilot.llm-gateway');
@@ -967,22 +958,52 @@ async function applyRecommendedPreset(provider: GatewayProvider): Promise<void> 
   await writeVSCodeSetting('github.copilot.chat.executionSubagent.enabled', true);
   await writeVSCodeSetting('github.copilot.chat.executionSubagent.model', '');
 
-  // 5. Write Copilot Memory: ON
+  // 5. Plan/Ask/Implement sub-agents: model="" (inherit parent model)
+  await writeVSCodeSetting('github.copilot.chat.planAgent.model', '');
+  await writeVSCodeSetting('github.copilot.chat.askAgent.model', '');
+  await writeVSCodeSetting('github.copilot.chat.implementAgent.model', '');
+
+  // 6. Write Copilot Memory: ON
   await writeVSCodeSetting('github.copilot.chat.tools.memory.enabled', true);
 
-  // 6. Read Copilot Memory: ON
+  // 7. Read Copilot Memory: ON
   await writeVSCodeSetting('github.copilot.chat.copilotMemory.enabled', true);
-
-  // 7. Default Model: clear (sub-agents follow main chat model dynamically)
-  await writeVSCodeSetting('chat.exploreAgent.defaultModel', undefined);
 
   // Force config reload so provider picks up the new useLmPassthrough value
   provider.refreshModels();
 
   vscode.window.showInformationMessage(
     'LLM Gateway: Recommended preset applied ✓ — ' +
-    'LM passthrough ON, sub-agents ON (following main model), memory ON'
+    'LM passthrough ON, sub-agents ON, memory ON'
   );
+
+  // 8. Show a submenu with Explore Agent model option
+  const exploreDefault = readVSCodeSetting('github.copilot.chat.exploreAgent.model');
+  const pick = await vscode.window.showQuickPick(
+    [
+      {
+        label: '$(rocket) Explore Agent Model',
+        description: exploreDefault ? `→ ${exploreDefault}` : '(not set — Copilot default)',
+        detail: 'Explore Agent cannot inherit parent model. Pick a Gateway model for it.',
+        id: 'exploreModel',
+      },
+      {
+        label: '$(check) Done',
+        description: 'Close',
+        id: 'done',
+      },
+    ],
+    {
+      title: 'LLM Gateway — Recommended Preset Applied',
+      placeHolder: 'Optionally configure Explore Agent model',
+    }
+  );
+
+  if (pick?.id === 'exploreModel') {
+    const snapshot = provider.getStatusSnapshot();
+    const availableModels = snapshot.models.map((m) => m.id);
+    await chooseSubagentDefaultModel(availableModels);
+  }
 }
 
 // ---------- Copilot System Config (top-level menu) ----------
@@ -1116,10 +1137,10 @@ async function copilotSystemSettingsFlow(): Promise<void> {
 }
 
 /**
- * Pick a Gateway model for `chat.exploreAgent.defaultModel`. Writes in the
- * `"id (copilot-llm-gateway)"` format VS Code uses to resolve models by
- * display name (vendor-qualified to avoid colliding with Copilot's official
- * same-named models).
+ * Pick a Gateway model for `github.copilot.chat.exploreAgent.model`. Writes
+ * in the `"id (copilot-llm-gateway)"` format VS Code uses to resolve models
+ * by display name (vendor-qualified to avoid colliding with Copilot's
+ * official same-named models).
  */
 async function chooseSubagentDefaultModel(availableModels: string[]): Promise<void> {
   if (availableModels.length === 0) {
@@ -1127,7 +1148,7 @@ async function chooseSubagentDefaultModel(availableModels: string[]): Promise<vo
     return;
   }
 
-  const current = readVSCodeSetting('chat.exploreAgent.defaultModel');
+  const current = readVSCodeSetting('github.copilot.chat.exploreAgent.model');
   // Strip optional "(vendor)" suffix so we can match exact model ids.
   const currentModelId = current?.replace(/\s*\([^)]*\)\s*$/, '').trim();
 
@@ -1159,14 +1180,14 @@ async function chooseSubagentDefaultModel(availableModels: string[]): Promise<vo
   }
 
   const pick = await vscode.window.showQuickPick(items, {
-    title: 'Sub-agent Default Model',
-    placeHolder: 'Pick a Gateway model for chat.exploreAgent.defaultModel',
+    title: 'Explore Agent Model',
+    placeHolder: 'Pick a Gateway model for github.copilot.chat.exploreAgent.model',
   });
 
   if (!pick) { return; }
 
   if (pick.action === 'clear') {
-    await writeVSCodeSetting('chat.exploreAgent.defaultModel', undefined);
+    await writeVSCodeSetting('github.copilot.chat.exploreAgent.model', undefined);
     return;
   }
 
@@ -1174,7 +1195,7 @@ async function chooseSubagentDefaultModel(availableModels: string[]): Promise<vo
     // Vendor-qualified format so Copilot's resolver picks our model, not
     // its own same-named model (vendor=copilot).
     await writeVSCodeSetting(
-      'chat.exploreAgent.defaultModel',
+      'github.copilot.chat.exploreAgent.model',
       `${pick.modelId} (copilot-llm-gateway)`
     );
   }
