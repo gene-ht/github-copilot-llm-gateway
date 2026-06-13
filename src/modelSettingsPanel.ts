@@ -21,13 +21,6 @@ const KNOWN_PARAMS: Array<{
   options?: string[];
 }> = [
   {
-    key: 'reasoning_effort',
-    label: 'reasoning_effort',
-    description: 'Thinking effort level (OpenAI/Anthropic)',
-    kind: 'dropdown',
-    options: ['low', 'medium', 'high'],
-  },
-  {
     key: 'temperature',
     label: 'temperature',
     description: 'Sampling temperature (0-2)',
@@ -53,7 +46,29 @@ function readSettings(): Record<string, Record<string, unknown>> {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
   const value = config.get<Record<string, Record<string, unknown>>>(CONFIG_KEY) ?? {};
   log(`readSettings: ${JSON.stringify(value)}`);
-  return value;
+  // VS Code returns a deeply-frozen object (wrapped in a Proxy). Mutating it
+  // directly throws "'isExtensible' on proxy: trap result does not reflect
+  // extensibility of proxy target". Clone into a plain, mutable object so
+  // callers can freely add/delete keys before writing back.
+  return cloneMutable(value);
+}
+
+/**
+ * Deep clone an arbitrary JSON-compatible value into a plain, mutable object
+ * tree. Used to escape VS Code's frozen configuration proxy.
+ */
+function cloneMutable<T>(value: T): T {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => cloneMutable(v)) as unknown as T;
+  }
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(value as Record<string, unknown>)) {
+    out[k] = cloneMutable((value as Record<string, unknown>)[k]);
+  }
+  return out as unknown as T;
 }
 
 async function writeSettings(settings: Record<string, Record<string, unknown>>): Promise<void> {

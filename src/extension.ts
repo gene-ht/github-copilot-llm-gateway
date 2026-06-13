@@ -18,11 +18,22 @@ const STATUS_BAR_PROBE_DELAY_MS = 1500;
 const RESPONDED_DISPLAY_MS = 10_000;
 
 // ---------- User settings.json helpers ----------
-// VS Code's configuration API refuses to write settings that aren't registered
-// by any installed extension. `github.copilot.advanced.debug.overrideProxyUrl`
-// is registered by the Copilot extension at runtime — if it isn't installed
-// (or hasn't activated yet) the write fails. These helpers patch the file
-// directly so the proxy can always configure itself.
+// The Copilot proxy needs to write `github.copilot.advanced.debug.overrideCapiUrl`
+// and `overrideProxyUrl` — both owned by the GitHub Copilot extension. Two
+// historical pain points shape this code:
+//
+//   1. `vscode.workspace.getConfiguration().update()` refuses keys that aren't
+//      registered by any installed/activated extension. If the Copilot
+//      extension hasn't activated yet (we run on `onStartupFinished`, which
+//      can race with Copilot's own activation) the update throws.
+//   2. Even when `update()` succeeds, the `onDidChangeConfiguration` event
+//      it fires is what causes Copilot's `DomainService` to re-read the
+//      override and refresh its `CAPIClient` — so going through the proper
+//      API also closes the "stale override" window without us needing to
+//      wait on a filesystem watcher to notice the JSON file changed.
+//
+// Strategy: try the proper API first; fall back to a direct settings.json
+// rewrite only when the API rejects the key.
 
 /**
  * Resolve the user-global `settings.json` path. Matches the platform
@@ -38,10 +49,25 @@ function getUserSettingsPath(): string {
 }
 
 /**
- * Write a dotted key (e.g. `"github.copilot.advanced.debug.overrideProxyUrl"`)
- * into the user `settings.json`, preserving all other entries.
+ * Split `"github.copilot.advanced.debug.overrideCapiUrl"` into the section
+ * VS Code's `getConfiguration` expects (`"github.copilot"`) and the leaf
+ * key under that section (`"advanced.debug.overrideCapiUrl"`).
+ *
+ * Copilot registers its settings under the `github.copilot` section, so we
+ * always split on the second dot. Returns `undefined` for keys that don't
+ * match this layout (callers will fall back to file-based writing).
  */
-async function writeUserSetting(key: string, value: unknown): Promise<void> {
+function splitCopilotSetting(dottedKey: string): { section: string; leaf: string } | undefined {
+  const prefix = 'github.copilot.';
+  if (!dottedKey.startsWith(prefix)) { return undefined; }
+  return { section: 'github.copilot', leaf: dottedKey.slice(prefix.length) };
+}
+
+/**
+ * Write `value` directly into `settings.json`, preserving every other entry.
+ * Used as a fallback when `WorkspaceConfiguration.update()` rejects the key.
+ */
+async function writeSettingToDisk(key: string, value: unknown): Promise<void> {
   const file = getUserSettingsPath();
   let settings: Record<string, unknown> = {};
   try {
@@ -53,17 +79,59 @@ async function writeUserSetting(key: string, value: unknown): Promise<void> {
 }
 
 /**
- * Remove a dotted key from the user `settings.json`.
+ * Remove `key` from `settings.json`. Used as a fallback when
+ * `WorkspaceConfiguration.update(..., undefined, ...)` rejects the key.
  */
-async function removeUserSetting(key: string): Promise<void> {
+async function removeSettingFromDisk(key: string): Promise<void> {
   const file = getUserSettingsPath();
   let settings: Record<string, unknown> = {};
   try {
     const raw = await fs.promises.readFile(file, 'utf8');
     settings = JSON.parse(raw);
   } catch { return; /* nothing to remove */ }
+  if (!(key in settings)) { return; }
   delete settings[key];
   await fs.promises.writeFile(file, JSON.stringify(settings, null, 4) + '\n', 'utf8');
+}
+
+/**
+ * Write a dotted key (e.g. `"github.copilot.advanced.debug.overrideProxyUrl"`)
+ * into the user-global settings. Prefers `WorkspaceConfiguration.update()`
+ * (which is synchronous from Copilot's perspective and triggers
+ * `onDidChangeConfiguration` immediately), and falls back to a direct
+ * `settings.json` rewrite when the proper API rejects the key.
+ */
+async function writeUserSetting(key: string, value: unknown): Promise<void> {
+  const split = splitCopilotSetting(key);
+  if (split) {
+    try {
+      const cfg = vscode.workspace.getConfiguration(split.section);
+      await cfg.update(split.leaf, value, vscode.ConfigurationTarget.Global);
+      return;
+    } catch {
+      // Fall through to direct file write — most commonly hit when the
+      // Copilot extension hasn't registered its configuration schema yet.
+    }
+  }
+  await writeSettingToDisk(key, value);
+}
+
+/**
+ * Remove a dotted key from the user-global settings. Same fallback strategy
+ * as `writeUserSetting`.
+ */
+async function removeUserSetting(key: string): Promise<void> {
+  const split = splitCopilotSetting(key);
+  if (split) {
+    try {
+      const cfg = vscode.workspace.getConfiguration(split.section);
+      await cfg.update(split.leaf, undefined, vscode.ConfigurationTarget.Global);
+      return;
+    } catch {
+      // Fall through to direct file write.
+    }
+  }
+  await removeSettingFromDisk(key);
 }
 
 /**
@@ -535,15 +603,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /**
    * Stop the proxy server and clear `overrideProxyUrl`.
+   *
+   * Order matters: we must clear the Copilot URL overrides *first*, then
+   * dispose the local HTTP server. Otherwise any in-flight Copilot request
+   * (or any request issued in the window between socket close and Copilot
+   * re-reading the cleared override) hits a dead port and surfaces to the
+   * user as "I disabled the proxy but Copilot is broken".
+   *
+   * `removeUserSetting` prefers `WorkspaceConfiguration.update()` which
+   * fires `onDidChangeConfiguration` synchronously, so Copilot's
+   * `DomainService` re-reads the cleared override before this function
+   * returns — by the time we call `dispose()` Copilot has already pointed
+   * itself back at `api.githubcopilot.com`.
    */
   const stopProxy = async (): Promise<void> => {
     if (!copilotProxy) { return; }
-    copilotProxy.dispose();
+    const proxyToDispose = copilotProxy;
     copilotProxy = undefined;
 
     // Clear both Copilot URL overrides so it reverts to its default endpoints
+    // BEFORE we tear down the local server. See doc comment above.
     await removeUserSetting('github.copilot.advanced.debug.overrideCapiUrl');
     await removeUserSetting('github.copilot.advanced.debug.overrideProxyUrl');
+
+    // Mark the server as disposing immediately — even though `close()` is
+    // async, any request that races in after this point is short-circuited
+    // by `handleRequest`'s kill-switch (see copilotProxyServer.ts).
+    proxyToDispose.dispose();
 
     outputChannel.appendLine('[CopilotProxy] Stopped, overrideProxyUrl cleared');
     vscode.window.showInformationMessage('LLM Gateway: Copilot proxy stopped');
@@ -594,13 +680,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     void startProxy();
   }
 
-  // React to config changes — restart proxy when upstream or proxy settings change
+  // React to config changes — restart proxy when upstream or proxy settings change.
+  //
+  // We need to distinguish two cases:
+  //   1. `copilotProxy.enabled` itself flipped → start/stop the server.
+  //      The QuickPick flow already does this directly, but if the user
+  //      hand-edits settings.json (or another extension toggles the value)
+  //      we must react here too — otherwise the server keeps listening with
+  //      `enabled=false`, falling through to its kill-switch on every request.
+  //   2. Everything else (serverUrl, headers, mapping, …) → hot-update the
+  //      running server's config without bouncing the port.
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration('github.copilot.llm-gateway')) { return; }
-      if (copilotProxy?.isRunning) {
-        const { upstream, proxy } = readProxyConfigs();
-        copilotProxy.updateConfig(upstream, proxy);
+      const { upstream, proxy } = readProxyConfigs();
+      const running = copilotProxy?.isRunning === true;
+
+      if (proxy.enabled && !running) {
+        void startProxy();
+        return;
+      }
+      if (!proxy.enabled && running) {
+        void stopProxy();
+        return;
+      }
+      if (running) {
+        copilotProxy?.updateConfig(upstream, proxy);
         outputChannel.appendLine('[CopilotProxy] Configuration updated');
       }
     })
@@ -892,7 +997,7 @@ async function subagentSettingsFlow(availableModels: string[]): Promise<void> {
 async function advancedSettingsFlow(_provider: GatewayProvider): Promise<void> {
   const pick = await vscode.window.showQuickPick(
     [
-      { label: '$(list-unordered) Model Settings', description: 'Per-model reasoning_effort, temperature, etc.', id: 'modelSettings' },
+      { label: '$(list-unordered) Model Settings', description: 'Per-model temperature, max_tokens, transport, etc.', id: 'modelSettings' },
       { label: '$(symbol-class) Sub-agent Settings', description: 'Configure Copilot sub-agents to use Gateway models', id: 'subagentSettings' },
       { label: '$(settings-gear) Copilot System Config', description: 'Memory, LM passthrough, transport toggles', id: 'copilotSystem' },
       { label: '$(globe) Proxy Server', description: 'Route Copilot background services through Gateway', id: 'copilotProxy' },

@@ -2,7 +2,7 @@
   "name": "github-copilot-llm-gateway-v2",
   "displayName": "GitHub Copilot LLM Gateway v2",
   "description": "Connect GitHub Copilot to open-source models via vLLM or any OpenAI-compatible server",
-  "version": "1.6.7",
+  "version": "1.7.0",
   "publisher": "AndrewButson",
   "icon": "assets/copilot-llm-gateway.png",
   "private": true,
@@ -52,17 +52,7 @@
       {
         "vendor": "copilot-llm-gateway",
         "displayName": "LLM Gateway",
-        "managementCommand": "github.copilot.llm-gateway.manage",
-        "configuration": {
-          "properties": {
-            "apiKey": {
-              "type": "string",
-              "secret": true,
-              "title": "API Key",
-              "description": "Optional bearer token sent to the inference server. Leave blank for unauthenticated local servers (vLLM, Ollama, llama.cpp). Stored by VS Code; takes precedence over the 'Configure Server' command's SecretStorage entry."
-            }
-          }
-        }
+        "managementCommand": "github.copilot.llm-gateway.manage"
       }
     ],
     "commands": [
@@ -226,7 +216,7 @@
             "type": "object",
             "additionalProperties": true
           },
-          "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nUse `transport` to select the request path per model: `'openai'` (default), `'anthropic'`, or `'lm-passthrough'`.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"transport\": \"anthropic\", \"reasoning_effort\": \"high\" },\n  \"gpt-5.5\": { \"reasoning_effort\": \"medium\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"transport\": \"lm-passthrough\" }\n}\n```",
+          "markdownDescription": "Per-model overrides keyed by model id. Each value is an object of extra request parameters that override `extraModelOptions` for that specific model.\n\nUse `transport` to select the request path per model: `'openai'` (default), `'anthropic'`, or `'lm-passthrough'`.\n\nNote: `reasoning_effort` is ignored here — use the **Thinking Effort** dropdown in the model picker instead. `max_input_tokens` is also ignored — the context window comes from the model's reported capabilities.\n\nExample:\n```json\n{\n  \"claude-opus-4.7\": { \"transport\": \"anthropic\", \"temperature\": 0.3 },\n  \"gpt-4o\": { \"transport\": \"lm-passthrough\" }\n}\n```",
           "order": 13
         },
         "github.copilot.llm-gateway.copilotProxy.enabled": {

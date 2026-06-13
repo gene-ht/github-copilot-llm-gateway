@@ -87,24 +87,25 @@ describe('buildModelInfo id-derived fields', () => {
 });
 
 describe('buildModelInfo context resolution', () => {
-  test('prefers max_input_tokens over the other context fields', () => {
+  test('treats max_input_tokens as the usable prompt budget (passed through, not reduced)', () => {
     const { totalContext, info, hasServerReportedContext } = buildModelInfo({
       model: baseModel({
         max_input_tokens: 936000,
-        max_model_len: 131072,
-        context_length: 8192,
-        context_window: 4096,
       }),
       defaultMaxTokens: 9999,
       defaultMaxOutputTokens: 2048,
       capabilities: {},
     });
-    assert.equal(totalContext, 936000);
-    assert.equal(info.maxInputTokens, 936000 - 2048 - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER);
+    // The gateway's max_input_tokens is already a usable prompt budget
+    // (upstream max_prompt_tokens), so it is surfaced as-is.
+    assert.equal(info.maxInputTokens, 936000);
+    // No family-table entry and no full-window field, so totalContext =
+    // prompt budget + output budget.
+    assert.equal(totalContext, 936000 + info.maxOutputTokens);
     assert.equal(hasServerReportedContext, true);
   });
 
-  test('prefers max_model_len over context_length and context_window', () => {
+  test('uses max_model_len as a full window when no prompt budget is reported', () => {
     const { totalContext, info, hasServerReportedContext } = buildModelInfo({
       model: baseModel({
         max_model_len: 131072,
@@ -116,7 +117,7 @@ describe('buildModelInfo context resolution', () => {
       capabilities: {},
     });
     assert.equal(totalContext, 131072);
-    assert.equal(info.maxInputTokens, 131072 - 2048 - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER);
+    assert.equal(info.maxInputTokens, 131072);
     assert.equal(hasServerReportedContext, true);
   });
 
@@ -155,7 +156,7 @@ describe('buildModelInfo context resolution', () => {
 });
 
 describe('buildModelInfo output token math', () => {
-  test('caps maxOutputTokens at the configured default', () => {
+  test('uses the configured default when the family is unknown', () => {
     const { info } = buildModelInfo({
       model: baseModel({ max_model_len: 131072 }),
       defaultMaxTokens: 32768,
@@ -165,22 +166,22 @@ describe('buildModelInfo output token math', () => {
     assert.equal(info.maxOutputTokens, 2048);
   });
 
-  test('reduces maxOutputTokens to leave the ADJUST_TOKEN_BUFFER headroom when the window is tight', () => {
-    const totalContext = 512;
+  test('uses the version-table maxOutputTokens when the version is known', () => {
     const { info } = buildModelInfo({
-      model: baseModel({ max_model_len: totalContext }),
+      model: baseModel({ id: 'gpt-5.5', version: 'gpt-5.5' }),
       defaultMaxTokens: 32768,
-      defaultMaxOutputTokens: 4096,
+      defaultMaxOutputTokens: 2048,
       capabilities: {},
     });
-    assert.equal(info.maxOutputTokens, totalContext - TOKEN_CONSTANTS.ADJUST_TOKEN_BUFFER);
+    // gpt-5.5 advertises 128000 output tokens upstream.
+    assert.equal(info.maxOutputTokens, 128000);
   });
 
   test('never drops below MIN_OUTPUT_TOKENS', () => {
     const { info } = buildModelInfo({
       model: baseModel({ max_model_len: TOKEN_CONSTANTS.MIN_OUTPUT_TOKENS }),
       defaultMaxTokens: 32768,
-      defaultMaxOutputTokens: 4096,
+      defaultMaxOutputTokens: 0,
       capabilities: {},
     });
     assert.equal(info.maxOutputTokens, TOKEN_CONSTANTS.MIN_OUTPUT_TOKENS);
@@ -213,24 +214,86 @@ describe('buildModelInfo description and tooltip', () => {
   });
 });
 
-describe('buildModelInfo capabilities pass-through', () => {
-  test('forwards capabilities as-is', () => {
+describe('buildModelInfo capabilities resolution', () => {
+  test('falls back to caller-provided defaults for unknown models (no guessing)', () => {
     const { info } = buildModelInfo({
-      model: baseModel(),
+      // An unknown id isn't in the capability table; with no inference, the
+      // caller-provided config defaults are used verbatim.
+      model: baseModel({ id: 'some-unknown-custom-model' }),
       defaultMaxTokens: 8192,
       defaultMaxOutputTokens: 2048,
       capabilities: { imageInput: true, toolCalling: 16 },
     });
-    assert.deepEqual(info.capabilities, { imageInput: true, toolCalling: 16 });
+    assert.deepEqual(info.capabilities, { toolCalling: 16, imageInput: true });
   });
 
-  test('accepts empty capabilities', () => {
+  test('leaves capabilities undefined for unknown models when no defaults are given', () => {
     const { info } = buildModelInfo({
-      model: baseModel(),
+      model: baseModel({ id: 'some-unknown-custom-model' }),
       defaultMaxTokens: 8192,
       defaultMaxOutputTokens: 2048,
       capabilities: {},
     });
-    assert.deepEqual(info.capabilities, {});
+    assert.deepEqual(info.capabilities, { toolCalling: undefined, imageInput: undefined });
+  });
+
+  test('resolves capabilities from the version table, ignoring caller defaults', () => {
+    const { info } = buildModelInfo({
+      model: baseModel({ id: 'claude-opus-4.8', version: 'claude-opus-4.8' }),
+      defaultMaxTokens: 8192,
+      defaultMaxOutputTokens: 2048,
+      capabilities: { imageInput: false, toolCalling: false },
+    });
+    // Version table says claude-opus-4.8 supports tools + vision.
+    assert.deepEqual(info.capabilities, { toolCalling: true, imageInput: true });
+  });
+});
+
+describe('buildModelInfo Thinking Effort configurationSchema', () => {
+  test('adds a reasoningEffort navigation property for reasoning models', () => {
+    const { info } = buildModelInfo({
+      model: baseModel({ id: 'gpt-5.5', version: 'gpt-5.5' }),
+      defaultMaxTokens: 8192,
+      defaultMaxOutputTokens: 2048,
+      capabilities: {},
+    });
+    const prop = info.configurationSchema?.properties?.reasoningEffort;
+    assert.ok(prop, 'expected a reasoningEffort schema property');
+    assert.equal(prop!.group, 'navigation');
+    assert.deepEqual(prop!.enum, ['none', 'low', 'medium', 'high', 'xhigh']);
+    assert.equal(prop!.default, 'high');
+  });
+
+  test('omits configurationSchema for non-reasoning models', () => {
+    const { info } = buildModelInfo({
+      model: baseModel({ id: 'gpt-4o', version: 'gpt-4o-2024-11-20' }),
+      defaultMaxTokens: 8192,
+      defaultMaxOutputTokens: 2048,
+      capabilities: {},
+    });
+    assert.equal(info.configurationSchema, undefined);
+  });
+
+  test('prefers the server-provided name/family/version over id-derived values', () => {
+    const { info, totalContext } = buildModelInfo({
+      model: baseModel({
+        id: 'claude-opus-4.8',
+        name: 'Claude Opus 4.8',
+        family: 'claude-opus-4.8',
+        version: 'claude-opus-4.8',
+        max_input_tokens: 935793,
+      }),
+      defaultMaxTokens: 8192,
+      defaultMaxOutputTokens: 2048,
+      capabilities: {},
+    });
+    assert.equal(info.name, 'Claude Opus 4.8');
+    assert.equal(info.family, 'claude-opus-4.8');
+    assert.equal(info.version, 'claude-opus-4.8');
+    assert.equal(info.maxInputTokens, 935793);
+    assert.equal(info.maxOutputTokens, 64000);
+    // Full window comes from the family table (1M), independent of the
+    // server-reported prompt budget.
+    assert.equal(totalContext, 1_000_000);
   });
 });

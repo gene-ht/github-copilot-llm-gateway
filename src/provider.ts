@@ -65,11 +65,6 @@ import {
   formatCapabilityLabels,
   formatContextLabel,
 } from './statusSnapshot';
-import {
-  FrameworkConfigOverride,
-  readFrameworkConfiguration,
-  resolveApiKey,
-} from './frameworkConfig';
 import { diagnoseModelFetchError } from './errorDiagnostics';
 import {
   ConfigurationTarget as SecretConfigurationTarget,
@@ -192,16 +187,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     apiKey: '',
     customHeaders: {},
   };
-  /**
-   * Latest API-key override supplied by VS Code's framework-managed
-   * `configuration` schema (the `chatProvider@4` proposed API used by native
-   * BYOK providers). Wins over the SecretStorage cache when set so users can
-   * manage credentials from the native model-picker UI without going through
-   * our bespoke `Configure Server` command. Empty values are meaningful —
-   * a user clearing the field in the native UI should override any stale
-   * SecretStorage entry.
-   */
-  private frameworkOverride: FrameworkConfigOverride = {};
   /**
    * Real server-reported context per model id (`max_input_tokens` / etc.).
    * Needed because the picker-facing `maxInputTokens` is only the usable input
@@ -440,15 +425,9 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
    * and the status bar don't double-probe.
    */
   async provideLanguageModelChatInformation(
-    options: { silent: boolean; configuration?: { readonly [key: string]: unknown } },
+    options: { silent: boolean },
     token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
-    // Pick up any framework-managed configuration (e.g. an apiKey entered via
-    // VS Code's native model-picker UI). Only mutates state when the
-    // configuration actually changed so we don't churn the cache on every
-    // picker open.
-    this.applyFrameworkConfiguration(options.configuration);
-
     const outcome = await this.getOrFetchModels(token);
     if (!options.silent && outcome.error) {
       this.promptOpenSettings(
@@ -456,32 +435,6 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       );
     }
     return outcome.models;
-  }
-
-  /**
-   * Merge a framework-supplied configuration into the in-memory override.
-   * Only forwards `apiKey` for now — `serverUrl` stays in workspace settings
-   * so the per-window scope picker (issue #23) keeps working. An explicit
-   * empty string is preserved as a "no key" override; a missing/non-string
-   * `apiKey` leaves the previous override untouched (defensive — the framework
-   * may simply not pass `configuration` on every call).
-   */
-  private applyFrameworkConfiguration(
-    configuration: { readonly [key: string]: unknown } | undefined
-  ): void {
-    const next = readFrameworkConfiguration(configuration);
-    if (next.apiKey === undefined) {
-      return;
-    }
-    if (next.apiKey === this.frameworkOverride.apiKey) {
-      return;
-    }
-    this.frameworkOverride.apiKey = next.apiKey;
-    this.outputChannel.appendLine(
-      'API key updated from VS Code framework configuration; reloading.'
-    );
-    this.invalidateModelCache();
-    this.reloadConfig();
   }
 
   /**
@@ -776,10 +729,37 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     );
     const callerOverride = safeShallowClone(options.modelOptions, 'options.modelOptions');
     const extraModelOptions = safeShallowClone(this.config.extraModelOptions, 'extraModelOptions');
+
+    // Strip request fields that are now owned by first-class mechanisms so a
+    // stale hand-written value in settings.json can't silently override them:
+    //   - `reasoning_effort`: driven by the picker's "Thinking Effort" dropdown
+    //     (LanguageModelChatInformation.configurationSchema), applied below.
+    //   - `max_input_tokens`: not a chat-completions body field; context window
+    //     is resolved from the version capability table + server-reported value.
+    const RESERVED_HACK_KEYS = ['reasoning_effort', 'max_input_tokens'] as const;
+    for (const reserved of RESERVED_HACK_KEYS) {
+      delete perModelOverride[reserved];
+      delete extraModelOptions[reserved];
+    }
+
+    // Per-model configuration the user selected in the picker UI (e.g. the
+    // "Thinking Effort" dropdown advertised via LanguageModelChatInformation.
+    // configurationSchema). Map our schema's `reasoningEffort` key onto the
+    // wire field `reasoning_effort`.
+    const modelConfiguration = safeShallowClone(
+      (options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration,
+      'options.modelConfiguration'
+    );
+    const pickerOverride: Record<string, unknown> = {};
+    if (typeof modelConfiguration.reasoningEffort === 'string' && modelConfiguration.reasoningEffort) {
+      pickerOverride.reasoning_effort = modelConfiguration.reasoningEffort;
+    }
+
     this.outputChannel.appendLine(
       `[Settings] model=${model.id} ` +
       `safeMaxOutputTokens=${safeMaxOutputTokens} ` +
       `perModel.keys=[${Object.keys(perModelOverride).join(',') || '(none)'}] ` +
+      `picker.keys=[${Object.keys(pickerOverride).join(',') || '(none)'}] ` +
       `caller.keys=[${Object.keys(callerOverride).join(',') || '(none)'}]`
     );
     if (Object.keys(perModelOverride).length > 0) {
@@ -796,9 +776,13 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       tools,
       toolChoice: hasTools ? this.mapToolChoice(options.toolMode) : undefined,
       parallelToolCalls: hasTools ? this.config.parallelToolCalling : undefined,
+      // Priority (low → high): global extra options, per-model pinned settings,
+      // the live picker selection (user's current explicit choice), then the
+      // explicit caller modelOptions.
       extraOptions: {
         ...extraModelOptions,
         ...perModelOverride,
+        ...pickerOverride,
         ...callerOverride,
       },
     });
@@ -1015,17 +999,76 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // body is available in the catch block even when the stream throws.
     const lmUrl = `${normalizeBaseUrl(this.config.serverUrl)}/v1/lm/chat`;
     const logFn = (msg: string) => this.outputChannel.appendLine(msg);
+
+    // Per-request configuration the user selected in the picker (Thinking
+    // Effort). For contextSize we fall back to the model's advertised
+    // `maxInputTokens` when the picker did not set it — this lets the upstream
+    // gateway open the official Copilot prompt budget to the full advertised
+    // window without requiring the user to toggle anything in the UI.
+    const modelConfiguration =
+      (options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration ?? {};
+    const reasoningEffort = modelConfiguration.reasoningEffort as string | undefined;
+    const pickerContextSize = modelConfiguration.contextSize as number | undefined;
+    const contextSize = pickerContextSize ?? (model.maxInputTokens > 0 ? model.maxInputTokens : undefined);
+
+    // Forward the user's local extension settings (extraModelOptions /
+    // perModelSettings) plus the caller's `options.modelOptions` into the
+    // wire's `model_options` bag, matching the OpenAI/Anthropic paths.
+    // VS Code config objects can be throwing-getter Proxies, so use a safe
+    // shallow clone instead of spreading directly.
+    const safeShallowClone = (src: unknown): Record<string, unknown> => {
+      const out: Record<string, unknown> = {};
+      if (!src || typeof src !== 'object') { return out; }
+      try {
+        for (const key of Object.keys(src as Record<string, unknown>)) {
+          try {
+            const value = (src as Record<string, unknown>)[key];
+            if (value !== undefined) { out[key] = value; }
+          } catch { /* skip throwing getters */ }
+        }
+      } catch { /* skip */ }
+      return out;
+    };
+    const perModelOverride = safeShallowClone(this.config.perModelSettings[model.id]);
+    const extraModelOptions = safeShallowClone(this.config.extraModelOptions);
+    const callerOverride = safeShallowClone(options.modelOptions);
+    // These are owned by dedicated wire fields (reasoning_effort / context_size)
+    // — never let a stale settings value sneak into the catch-all bag and
+    // override the first-class mechanism.
+    for (const reserved of ['reasoning_effort', 'max_input_tokens', 'context_size'] as const) {
+      delete perModelOverride[reserved];
+      delete extraModelOptions[reserved];
+      delete callerOverride[reserved];
+    }
+    const mergedModelOptions: Record<string, unknown> = {
+      ...extraModelOptions,
+      ...perModelOverride,
+      ...callerOverride,
+    };
+    const passthroughModelOptions =
+      Object.keys(mergedModelOptions).length > 0 ? mergedModelOptions : undefined;
+
     const serializedBody = {
       model: model.id,
       messages: repairToolResultPairing(serializeMessages(messages), logFn),
       tools: serializeTools(options.tools),
+      ...(options.toolMode !== undefined
+        ? { tool_mode: options.toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto' }
+        : {}),
+      ...(passthroughModelOptions !== undefined ? { model_options: passthroughModelOptions } : {}),
+      ...(reasoningEffort !== undefined ? { reasoning_effort: reasoningEffort } : {}),
+      ...(contextSize !== undefined ? { context_size: contextSize } : {}),
     };
 
     try {
       if (this.config.verboseLogging) {
         this.outputChannel.appendLine(
           `[lm-passthrough] model=${model.id} ` +
-          `messages=${messages.length} tools=${options.tools?.length ?? 0}`
+          `messages=${messages.length} tools=${options.tools?.length ?? 0} ` +
+          `reasoningEffort=${reasoningEffort ?? '-'} contextSize=${contextSize ?? '-'} ` +
+          `extra.keys=[${Object.keys(extraModelOptions).join(',') || '(none)'}] ` +
+          `perModel.keys=[${Object.keys(perModelOverride).join(',') || '(none)'}] ` +
+          `caller.keys=[${Object.keys(callerOverride).join(',') || '(none)'}]`
         );
       }
 
@@ -1041,6 +1084,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         token,
         log: logFn,
         verbose: this.config.verboseLogging,
+        toolMode: options.toolMode,
+        modelOptions: passthroughModelOptions,
+        reasoningEffort,
+        contextSize,
       });
 
       if (this.config.verboseLogging) {
@@ -1050,11 +1097,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
         );
       }
 
-      this.recordCompletedRequest(model.id, modelName, undefined);
+      this.recordCompletedRequest(model.id, modelName, result.stats.usage);
       this._onDidChangeRequestState.fire({
         kind: 'complete',
         modelId: model.id,
         modelName,
+        ...(result.stats.usage ? { usage: result.stats.usage } : {}),
       });
     } catch (error) {
       // ── Context too long → attempt compaction + retry ──────────────
@@ -1085,6 +1133,10 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
               token,
               log: logFn,
               verbose: this.config.verboseLogging,
+              toolMode: options.toolMode,
+              modelOptions: passthroughModelOptions,
+              reasoningEffort,
+              contextSize,
             });
 
             if (this.config.verboseLogging) {
@@ -1094,11 +1146,12 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
               );
             }
 
-            this.recordCompletedRequest(model.id, modelName, undefined);
+            this.recordCompletedRequest(model.id, modelName, retryResult.stats.usage);
             this._onDidChangeRequestState.fire({
               kind: 'complete',
               modelId: model.id,
               modelName,
+              ...(retryResult.stats.usage ? { usage: retryResult.stats.usage } : {}),
             });
             return; // Compaction + retry succeeded
           }
@@ -1242,7 +1295,32 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
       const perModelOverride = safeShallowClone(this.config.perModelSettings[model.id]);
       const callerOverride = safeShallowClone(options.modelOptions);
       const extraModelOptions = safeShallowClone(this.config.extraModelOptions);
-      const mergedExtras = { ...extraModelOptions, ...perModelOverride, ...callerOverride };
+
+      // Strip request fields now owned by first-class mechanisms so a stale
+      // hand-written value can't override them (mirrors the OpenAI path):
+      //   - `reasoning_effort`: driven by the picker's "Thinking Effort" dropdown
+      //     (mapped to Anthropic `thinking` in buildAnthropicRequest).
+      //   - `max_input_tokens`: not a request body field.
+      for (const reserved of ['reasoning_effort', 'max_input_tokens'] as const) {
+        delete perModelOverride[reserved];
+        delete extraModelOptions[reserved];
+        delete callerOverride[reserved];
+      }
+
+      // The picker's live "Thinking Effort" selection is the single source for
+      // reasoning effort; surface it as `reasoning_effort` for buildAnthropicRequest.
+      const pickerOverride: Record<string, unknown> = {};
+      const anthropicModelConfiguration = safeShallowClone(
+        (options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration
+      );
+      if (
+        typeof anthropicModelConfiguration.reasoningEffort === 'string' &&
+        anthropicModelConfiguration.reasoningEffort
+      ) {
+        pickerOverride.reasoning_effort = anthropicModelConfiguration.reasoningEffort;
+      }
+
+      const mergedExtras = { ...extraModelOptions, ...perModelOverride, ...pickerOverride, ...callerOverride };
 
       const temperature = hasTools ? this.config.agentTemperature : undefined;
 
@@ -1964,12 +2042,11 @@ export class GatewayProvider implements vscode.LanguageModelChatProvider {
     // an early model fetch would just send unauthenticated requests.
     const cfg: GatewayConfig = {
       serverUrl: config.get<string>('serverUrl', 'http://localhost:8000'),
-      // Framework-managed API key (from VS Code's native model-picker UI) wins
-      // over the SecretStorage cache. Falls back to SecretStorage when nothing
-      // has come in via the configuration arg yet, which preserves the
-      // existing Configure Server flow for users on builds without the
-      // framework UI.
-      apiKey: resolveApiKey(this.frameworkOverride, this.secretCache.apiKey),
+      // API key comes from the SecretStorage cache (populated by
+      // `loadSecrets` / `refreshSecretCache`), set via the Configure Server
+      // command. Until `loadSecrets` runs, the cache holds an empty value —
+      // an early model fetch would just send unauthenticated requests.
+      apiKey: this.secretCache.apiKey,
       requestTimeout: config.get<number>('requestTimeout', DEFAULT_REQUEST_TIMEOUT_MS),
       defaultMaxTokens: config.get<number>('defaultMaxTokens', TOKEN_CONSTANTS.DEFAULT_CONTEXT_TOKENS),
       defaultMaxOutputTokens: config.get<number>(

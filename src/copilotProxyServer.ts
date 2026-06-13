@@ -118,6 +118,13 @@ export class CopilotProxyServer {
   private upstreamConfig: ProxyUpstreamConfig;
   private proxyConfig: CopilotProxyConfig;
   private readonly log: ProxyLogger;
+  /**
+   * Set to `true` from the moment `stop()`/`dispose()` is called. Used by
+   * `handleRequest` as a kill-switch so any request that races in between
+   * "we decided to stop" and "the OS actually finishes closing the socket"
+   * gets a clean 503 instead of being proxied.
+   */
+  private isDisposing = false;
   /** Fallback model when a mapping yields '' — set externally by the caller. */
   public fallbackModel: string | undefined;
 
@@ -175,10 +182,13 @@ export class CopilotProxyServer {
   }
 
   /**
-   * Gracefully stop the HTTP server.
+   * Gracefully stop the HTTP server. Marks the instance as disposing first
+   * so any in-flight `handleRequest` invocation can short-circuit with 503
+   * instead of starting new upstream work.
    */
   stop(): Promise<void> {
     return new Promise((resolve) => {
+      this.isDisposing = true;
       if (!this.server) { resolve(); return; }
       this.server.close(() => {
         this.log('Copilot proxy server stopped');
@@ -198,6 +208,26 @@ export class CopilotProxyServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = req.url ?? '';
     this.logVerbose(`← ${req.method} ${url}`);
+
+    // Kill-switch: refuse all traffic once disabled or shutting down.
+    //
+    // There are three independent paths that can leave us in a state where
+    // the server is still listening but should not be proxying:
+    //   1. User toggled `copilotProxy.enabled` off via QuickPick — extension
+    //      calls `stopProxy()` (async) but the OS hasn't closed the socket yet.
+    //   2. User manually edited settings.json to flip `enabled` to false —
+    //      the `onDidChangeConfiguration` watcher in extension.ts only calls
+    //      `updateConfig()`, so the server keeps listening with `enabled=false`.
+    //   3. A request arrives in the gap between Copilot reading the cleared
+    //      `overrideCapiUrl`/`overrideProxyUrl` and the actual socket close.
+    // In all three cases we want a deterministic 503 instead of accidentally
+    // pass-through'ing the request to `api.githubcopilot.com` (which would
+    // look — from the user's perspective — like "I disabled the proxy but
+    // it's still proxying Copilot").
+    if (this.isDisposing || !this.proxyConfig.enabled) {
+      writeJsonError(res, 503, 'Copilot proxy is disabled');
+      return;
+    }
 
     // CORS preflight
     if (req.method === 'OPTIONS') {

@@ -39,17 +39,31 @@ declare module 'vscode' {
     detail?: string;
     isUserSelectable?: boolean;
     multiplierNumeric?: number;
+    /**
+     * Optional JSON-schema-like descriptor for per-model configuration shown
+     * in the model picker (e.g. a "Thinking Effort" dropdown). Part of the
+     * `chatProvider` proposed API; present at runtime in VS Code 1.120 even
+     * though it isn't in the stable `@types/vscode` yet. A property with
+     * `group: 'navigation'` is surfaced as a primary picker action.
+     */
+    configurationSchema?: {
+      properties?: {
+        [key: string]: Record<string, unknown> & {
+          enumItemLabels?: string[];
+          group?: string;
+        };
+      };
+    };
   }
 
   /**
-   * Native Copilot Chat BYOK providers receive the user-configured API key
-   * (and other declared schema properties) via the `configuration` field on
-   * the options bag. This is part of the `chatProvider@4` proposed API; it's
-   * present at runtime in VS Code 1.120 even though it isn't in the stable
-   * `@types/vscode` yet. Falling back to SecretStorage when undefined keeps
-   * us compatible with older builds.
+   * Per-model configuration the user selected in the picker (e.g.
+   * `{ reasoningEffort: 'high' }`), delivered to
+   * `provideLanguageModelChatResponse`. Part of the `chatProvider` proposed
+   * API; present at runtime in VS Code 1.120 even though it isn't in the
+   * stable `@types/vscode` yet.
    */
-  interface PrepareLanguageModelChatModelOptions {
-    readonly configuration?: { readonly [key: string]: unknown };
+  interface ProvideLanguageModelChatResponseOptions {
+    readonly modelConfiguration?: { readonly [key: string]: unknown };
   }
 }

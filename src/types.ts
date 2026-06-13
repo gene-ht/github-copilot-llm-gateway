@@ -7,6 +7,12 @@ export interface OpenAIModel {
   object: string;
   created: number;
   owned_by: string;
+  /** Display name, when the server provides one (e.g. Copilot gateway). */
+  name?: string;
+  /** Opaque family name. For the Copilot gateway this equals the upstream `capabilities.family`. */
+  family?: string;
+  /** Opaque version string, when the server provides one. */
+  version?: string;
   /** GitHub Copilot model registry */
   max_input_tokens?: number;
   /** vLLM, LiteLLM */

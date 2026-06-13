@@ -18,6 +18,13 @@
 import * as vscode from 'vscode';
 import { buildHeaders, normalizeBaseUrl } from './client';
 
+/**
+ * MIME type VS Code 1.120 watches for on `LanguageModelDataPart`s to extract
+ * token usage and feed it into the chat context-window widget. Must match the
+ * constant used by the OpenAI/Anthropic paths (see microsoft/vscode#315394).
+ */
+const USAGE_DATA_PART_MIME_TYPE = 'usage';
+
 // ============================================================================
 // Serialization: VS Code types → JSON wire format
 // ============================================================================
@@ -55,11 +62,41 @@ export interface LmToolPayload {
 
 /**
  * Request body for `POST /lm/chat`.
+ *
+ * Wire protocol is point-to-point between this extension and the upstream
+ * gateway. Field names are fixed (no aliases) — both sides must agree.
  */
 export interface LmChatRequest {
   model: string;
   messages: LmMessagePayload[];
   tools?: LmToolPayload[];
+  /**
+   * Tool-selecting mode. Maps from VS Code's `LanguageModelChatToolMode`:
+   *   - `'auto'`     -> Auto
+   *   - `'required'` -> Required
+   * Upstream maps it back to the same enum on `vscode.lm.sendRequest`.
+   */
+  tool_mode?: 'auto' | 'required';
+  /**
+   * Public `modelOptions` from `vscode.LanguageModelChatRequestOptions`.
+   * Transparently forwarded to upstream `sendRequest(...).options.modelOptions`.
+   * The receiving provider decides which keys it honors (e.g. official Copilot
+   * applies a whitelist of `stop` / `temperature` / `max_tokens` /
+   * `frequency_penalty` / `presence_penalty`; other keys are dropped). This
+   * layer does no filtering.
+   */
+  model_options?: Record<string, unknown>;
+  /**
+   * Picker "Thinking Effort" selection. Upstream injects this into the
+   * official Copilot provider's `configuration.reasoningEffort`.
+   */
+  reasoning_effort?: string;
+  /**
+   * Prompt/input budget. Upstream injects this into the official Copilot
+   * provider's `configuration.contextSize` to override the endpoint's
+   * prompt budget.
+   */
+  context_size?: number;
 }
 
 /**
@@ -248,6 +285,7 @@ export type LmSseEvent =
   | { type: 'text'; value: string }
   | { type: 'tool_call'; callId: string; name: string; input: unknown }
   | { type: 'thinking'; value: string; id?: string; metadata?: Record<string, unknown> }
+  | { type: 'usage'; inputTokens?: number; outputTokens?: number }
   | { type: 'error'; message: string }
   | { type: 'done' };
 
@@ -267,12 +305,22 @@ export interface LmPassthroughParams {
   token: vscode.CancellationToken;
   log: (message: string) => void;
   verbose: boolean;
+  /** Per-request tool-selecting mode to forward upstream. */
+  toolMode?: vscode.LanguageModelChatToolMode;
+  /** Public modelOptions from `LanguageModelChatRequestOptions` to forward upstream verbatim. */
+  modelOptions?: Record<string, unknown>;
+  /** Per-request reasoning effort (picker "Thinking Effort") to forward upstream. */
+  reasoningEffort?: string;
+  /** Per-request context window (prompt budget) to forward upstream. */
+  contextSize?: number;
 }
 
 export interface LmPassthroughStats {
   totalTextParts: number;
   totalToolCalls: number;
   totalThinkingParts: number;
+  /** Token usage reported by the upstream `usage` SSE event, if any. */
+  usage?: { prompt: number; completion: number; total: number };
 }
 
 export interface LmPassthroughResult {
@@ -295,6 +343,7 @@ export async function streamLmPassthrough(
   const {
     serverUrl, apiKey, customHeaders, requestTimeout,
     model, messages, tools, progress, token, log, verbose,
+    toolMode, modelOptions, reasoningEffort, contextSize,
   } = params;
 
   const stats: LmPassthroughStats = {
@@ -327,10 +376,22 @@ export async function streamLmPassthrough(
     }
   }
 
+  // Wire is a transparent pipe: forward whatever Copilot supplied. We only
+  // suppress fields Copilot left `undefined`, and we map the only field that
+  // requires type translation (`toolMode` enum -> wire string).
+  const wireToolMode: 'auto' | 'required' | undefined =
+    toolMode === undefined
+      ? undefined
+      : (toolMode === vscode.LanguageModelChatToolMode.Required ? 'required' : 'auto');
+
   const body: LmChatRequest = {
     model,
     messages: repairedMessages,
     tools: serializeTools(tools),
+    ...(wireToolMode !== undefined ? { tool_mode: wireToolMode } : {}),
+    ...(modelOptions !== undefined ? { model_options: modelOptions } : {}),
+    ...(reasoningEffort !== undefined ? { reasoning_effort: reasoningEffort } : {}),
+    ...(contextSize !== undefined ? { context_size: contextSize } : {}),
   };
 
   const baseUrl = normalizeBaseUrl(serverUrl);
@@ -420,6 +481,28 @@ export async function streamLmPassthrough(
             );
             progress.report(tp);
             stats.totalThinkingParts++;
+            break;
+          }
+
+          case 'usage': {
+            // Forward token usage to VS Code's context-window widget via a
+            // `usage`-mime LanguageModelDataPart (microsoft/vscode#315394),
+            // mirroring the OpenAI/Anthropic paths' reportUsage. Upstream
+            // sends inputTokens/outputTokens; normalize to the OpenAI shape.
+            const prompt = event.inputTokens ?? 0;
+            const completion = event.outputTokens ?? 0;
+            const usagePayload = {
+              prompt_tokens: prompt,
+              completion_tokens: completion,
+              total_tokens: prompt + completion,
+            };
+            stats.usage = { prompt, completion, total: prompt + completion };
+            progress.report(
+              new vscode.LanguageModelDataPart(
+                new TextEncoder().encode(JSON.stringify(usagePayload)),
+                USAGE_DATA_PART_MIME_TYPE
+              )
+            );
             break;
           }
 

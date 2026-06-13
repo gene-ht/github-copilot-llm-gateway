@@ -225,4 +225,76 @@ describe('CopilotProxyServer', () => {
       mockUpstream.close();
     }
   });
+
+  // ---------- kill-switch (enabled=false / disposing) ----------
+
+  test('kill-switch: returns 503 on /chat/completions when enabled is false', async () => {
+    // Server is started with enabled=true so it can bind the port, then the
+    // config is hot-flipped to enabled=false. This simulates the user
+    // hand-editing settings.json — the watcher fires updateConfig() but the
+    // server is still listening, and we want it to reject all traffic.
+    server = new CopilotProxyServer(upstream, { ...proxy, enabled: true });
+    const port = await server.start();
+    server.updateConfig(upstream, { ...proxy, enabled: false });
+
+    const res = await fetch(`http://127.0.0.1:${port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4o-mini', messages: [] }),
+    });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.match(body.error.message, /disabled/i);
+  });
+
+  test('kill-switch: returns 503 on pass-through path when enabled is false', async () => {
+    // The pass-through path (GET /models, etc.) is the most dangerous one
+    // because it forwards to api.githubcopilot.com unconditionally. The
+    // kill-switch must guard it too, otherwise "disable" still proxies
+    // every non-chat-completions request.
+    server = new CopilotProxyServer(upstream, { ...proxy, enabled: true });
+    const port = await server.start();
+    server.updateConfig(upstream, { ...proxy, enabled: false });
+
+    const res = await fetch(`http://127.0.0.1:${port}/models`);
+    assert.equal(res.status, 503);
+  });
+
+  test('kill-switch: returns 503 on /v1/messages when enabled is false', async () => {
+    server = new CopilotProxyServer(upstream, { ...proxy, enabled: true });
+    const port = await server.start();
+    server.updateConfig(upstream, { ...proxy, enabled: false });
+
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-3-5-sonnet', messages: [] }),
+    });
+    assert.equal(res.status, 503);
+  });
+
+  test('kill-switch: re-enabling restores normal routing without restart', async () => {
+    // Disabling then re-enabling via updateConfig should restore traffic
+    // without needing to bounce the port. Verifies the kill-switch is purely
+    // config-driven (not sticky once tripped).
+    server = new CopilotProxyServer(upstream, { ...proxy, enabled: true });
+    const port = await server.start();
+
+    server.updateConfig(upstream, { ...proxy, enabled: false });
+    const blocked = await fetch(`http://127.0.0.1:${port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not json',
+    });
+    assert.equal(blocked.status, 503);
+
+    server.updateConfig(upstream, { ...proxy, enabled: true });
+    const allowed = await fetch(`http://127.0.0.1:${port}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not json',
+    });
+    // Now we should hit the JSON parser (400), not the kill-switch (503).
+    assert.equal(allowed.status, 400);
+  });
 });
